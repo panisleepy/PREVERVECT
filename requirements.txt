@@ -1,0 +1,11 @@
+torch
+torchvision
+timm
+opencv-python
+mediapipe
+mss
+numpy<2
+scipy<1.14
+opencv-contrib-python<4.12
+matplotlib
+pygetwindow
