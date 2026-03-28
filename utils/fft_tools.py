@@ -42,3 +42,27 @@ def fft_to_tensor(frame_bgr: np.ndarray, size: int = 224) -> torch.Tensor:
     resized = cv2.resize(spectrum, (size, size), interpolation=cv2.INTER_LINEAR)
     tensor = torch.from_numpy(np.transpose(resized, (2, 0, 1))).unsqueeze(0)
     return tensor
+
+
+def power_spectrum_shifted_bgr(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    Convert BGR frame to centered 2D power spectrum image.
+
+    Steps:
+      1) grayscale
+      2) 2D FFT
+      3) shift DC component to center
+      4) power spectrum = |F(u,v)|^2
+      5) log compress and normalize to [0, 1]
+
+    Returns:
+        np.ndarray [H, W, 3], float32 in [0, 1].
+    """
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+    power = np.abs(fshift) ** 2
+    power_log = np.log1p(power)
+    power_norm = cv2.normalize(power_log, None, 0.0, 1.0, cv2.NORM_MINMAX)
+    spectrum = np.repeat(power_norm[..., None], 3, axis=2).astype(np.float32)
+    return spectrum

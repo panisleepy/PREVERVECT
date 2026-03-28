@@ -1,142 +1,79 @@
-"""Realtime screen capture + face ROI + SpecXNet inference."""
+"""Realtime PREVERVECT detector with threaded inference and glass UI."""
 
 from __future__ import annotations
 
 import argparse
+import csv
+import math
+import threading
+import time
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 import sys
-import time
+import urllib.request
 
 import cv2
 import mediapipe as mp
 import mss
 import numpy as np
 import torch
+from scipy.signal import butter, filtfilt, welch
 
-# Ensure project-root imports work when running:
-#   python capture/screen_detector.py
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.model import build_specxnet
-from utils.fft_tools import bgr_to_tensor, fft_to_tensor
+from utils.fft_tools import power_spectrum_shifted_bgr
 
 
-WINDOW_NAME = "PREVERVECT Realtime Detector"
-PANEL_WIDTH = 300
+LIVE_WINDOW_NAME = "PREVERVECT Live Feed"
+CONSOLE_WINDOW_NAME = "PREVERVECT Console"
+PANEL_WIDTH = 430
+PANEL_HEIGHT = 560
+MODEL_SIZE = 224
 
+# Palette: #FFD1DC, #AEC6CF, #F5F5DC in BGR.
+SOFT_PINK = (220, 209, 255)
+PASTEL_BLUE = (207, 198, 174)
+BEIGE = (220, 245, 245)
+SOFT_WHITE = (245, 245, 245)
 
-def _create_face_detector():
-    """
-    Create face detector with robust fallback.
-    1) MediaPipe FaceMesh (if mp.solutions exists in current package build)
-    2) OpenCV Haar cascade fallback
-    """
-    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
-        face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        return "mediapipe", face_mesh
-
-    # Fallback for environments where `mediapipe.solutions` is not exposed.
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(cascade_path)
-    if cascade.empty():
-        raise RuntimeError("Failed to load OpenCV Haar cascade face detector.")
-    return "opencv", cascade
+FOREHEAD_IDX = [10, 67, 103, 109, 338, 297, 332, 284]
+LEFT_CHEEK_IDX = [117, 118, 119, 120, 100, 126, 142, 203, 205, 50, 36]
+RIGHT_CHEEK_IDX = [346, 347, 348, 349, 329, 355, 371, 423, 425, 280, 266]
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Realtime screen deepfake detector")
-    parser.add_argument(
-        "--target_window",
-        type=str,
-        default="",
-        help='Window title keyword for auto capture (e.g. "Chrome", "YouTube").',
-    )
+    parser = argparse.ArgumentParser(description="Realtime PREVERVECT screen detector")
+    parser.add_argument("--target_window", type=str, default="", help="Window title keyword to capture.")
+    parser.add_argument("--log_dir", type=Path, default=Path("logs"), help="Session CSV output folder.")
     return parser.parse_args()
 
 
 def _get_monitor_from_window_title(title_keyword: str) -> dict[str, int] | None:
-    """
-    Try to locate an OS window by title and return its rectangle as monitor.
-    Returns None if pygetwindow is unavailable or no match is found.
-    """
     if not title_keyword:
         return None
     try:
         import pygetwindow as gw
     except Exception:
         return None
-
     keyword = title_keyword.lower()
     candidates = [w for w in gw.getAllWindows() if w.title and keyword in w.title.lower()]
     if not candidates:
         return None
-
-    # Pick the largest matching visible window.
     best = max(candidates, key=lambda w: max(0, w.width) * max(0, w.height))
-    left, top, width, height = int(best.left), int(best.top), int(best.width), int(best.height)
-    if width <= 0 or height <= 0:
+    if best.width <= 0 or best.height <= 0:
         return None
-    return {"top": top, "left": left, "width": width, "height": height}
+    return {"top": int(best.top), "left": int(best.left), "width": int(best.width), "height": int(best.height)}
 
 
 def _mcdm_preprocess_placeholder(face_roi: np.ndarray) -> np.ndarray:
-    """
-    Placeholder for future MCDM defense pipeline.
-    Keep this function in the inference path as an integration point.
-    """
     return face_roi
 
 
-def _detect_face_bbox(frame_bgr: np.ndarray, detector_type: str, detector_obj):
-    """Return a single face bbox (x0, y0, x1, y1) or None."""
-    h, w = frame_bgr.shape[:2]
-    if detector_type == "mediapipe":
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = detector_obj.process(rgb)
-        if not results.multi_face_landmarks:
-            return None
-        landmarks = results.multi_face_landmarks[0].landmark
-        xs = np.array([lm.x for lm in landmarks]) * w
-        ys = np.array([lm.y for lm in landmarks]) * h
-        x0, y0 = int(xs.min()), int(ys.min())
-        x1, y1 = int(xs.max()), int(ys.max())
-    else:
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        faces = detector_obj.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-        if len(faces) == 0:
-            return None
-        # pick largest face
-        x, y, fw, fh = max(faces, key=lambda b: b[2] * b[3])
-        x0, y0, x1, y1 = int(x), int(y), int(x + fw), int(y + fh)
-
-    pad_x = int((x1 - x0) * 0.15)
-    pad_y = int((y1 - y0) * 0.20)
-    return clamp_bbox(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y, w, h)
-
-
-def load_model(device: torch.device) -> torch.nn.Module:
-    """
-    Load SpecXNet and optional fine-tuned weights.
-    If no fine-tuned file exists, pretrained backbone weights are used for flow testing.
-    """
-    model = build_specxnet(pretrained=True, device=device)
-    weight_path = Path("weights/specxnet_finetuned.pt")
-    if weight_path.exists():
-        state = torch.load(weight_path, map_location=device)
-        model.load_state_dict(state, strict=False)
-    model.eval()
-    return model
-
-
-def clamp_bbox(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int, int, int, int]:
+def _clamp_bbox(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int, int, int, int]:
     x0 = max(0, min(x0, w - 1))
     y0 = max(0, min(y0, h - 1))
     x1 = max(1, min(x1, w))
@@ -144,131 +81,568 @@ def clamp_bbox(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int,
     return x0, y0, x1, y1
 
 
-def _draw_capture_guide(frame: np.ndarray) -> tuple[int, int, int, int]:
-    """Draw where users should place video content in the capture preview."""
-    h, w = frame.shape[:2]
-    gw = int(w * 0.66)
-    gh = int(h * 0.82)
-    x0 = (w - gw) // 2
-    y0 = (h - gh) // 2
-    x1 = x0 + gw
-    y1 = y0 + gh
-    color = (120, 220, 255)
-    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
-    cv2.putText(
-        frame,
-        "Detection Range (place video inside)",
-        (x0 + 10, max(25, y0 - 10)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        color,
-        2,
-    )
-    return x0, y0, x1, y1
+def _poly_from_landmarks(landmarks, indices: list[int], w: int, h: int) -> np.ndarray:
+    pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in indices]
+    return np.asarray(pts, dtype=np.int32)
 
 
-def _render_overlay_panel(
-    frame: np.ndarray,
-    trust_score: float,
+def _weighted_mean_rgb(frame_bgr: np.ndarray, poly: np.ndarray) -> tuple[float, float, float]:
+    h, w = frame_bgr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, poly, 255)
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 8:
+        return np.nan, np.nan, np.nan
+    cx, cy = float(np.mean(xs)), float(np.mean(ys))
+    dx = xs.astype(np.float32) - cx
+    dy = ys.astype(np.float32) - cy
+    sigma2 = float(np.var(xs) + np.var(ys) + 1e-6)
+    weights = np.exp(-(dx * dx + dy * dy) / (2.0 * sigma2))
+    p = frame_bgr[ys, xs].astype(np.float32)
+    denom = float(np.sum(weights)) + 1e-6
+    b = float(np.sum(p[:, 0] * weights) / denom)
+    g = float(np.sum(p[:, 1] * weights) / denom)
+    r = float(np.sum(p[:, 2] * weights) / denom)
+    return r, g, b
+
+
+def _to_model_tensor_rgb(face_bgr: np.ndarray) -> torch.Tensor:
+    resized = cv2.resize(face_bgr, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    rgb = (rgb - mean) / std
+    return torch.from_numpy(np.transpose(rgb, (2, 0, 1))).unsqueeze(0)
+
+
+def _to_model_tensor_fft(face_bgr: np.ndarray) -> tuple[torch.Tensor, np.ndarray]:
+    spec = power_spectrum_shifted_bgr(face_bgr)
+    spec_resized = cv2.resize(spec, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    norm = (spec_resized - 0.5) / 0.5
+    tensor = torch.from_numpy(np.transpose(norm, (2, 0, 1))).unsqueeze(0)
+    thumb = (spec_resized * 255.0).clip(0, 255).astype(np.uint8)
+    return tensor, thumb
+
+
+def _pos_signal(rgb_trace: np.ndarray, fps: float, win_sec: float = 1.6) -> np.ndarray:
+    t = len(rgb_trace)
+    if t < 4:
+        return np.zeros(t, dtype=np.float32)
+    win = max(4, int(round(win_sec * fps)))
+    win = min(win, t)
+    p = np.array([[0.0, 1.0, -1.0], [-2.0, 1.0, 1.0]], dtype=np.float32)
+    s = np.zeros(t, dtype=np.float32)
+    wsum = np.zeros(t, dtype=np.float32)
+    for n in range(0, t - win + 1):
+        seg = rgb_trace[n : n + win]
+        mu = np.mean(seg, axis=0) + 1e-6
+        cn = (seg / mu) - 1.0
+        proj = p @ cn.T
+        alpha = float(np.std(proj[0]) / (np.std(proj[1]) + 1e-6))
+        h = proj[0] - alpha * proj[1]
+        h = h - np.mean(h)
+        s[n : n + win] += h
+        wsum[n : n + win] += 1.0
+    valid = wsum > 0
+    s[valid] = s[valid] / wsum[valid]
+    if np.std(s) > 1e-6:
+        s = (s - np.mean(s)) / (np.std(s) + 1e-6)
+    return s
+
+
+def _filter_pos(sig: np.ndarray, fps: float) -> np.ndarray:
+    if len(sig) < 24:
+        return sig
+    nyq = 0.5 * fps
+    low = 0.7 / max(nyq, 1e-6)
+    high = min(3.0 / max(nyq, 1e-6), 0.99)
+    if low >= high:
+        return sig
+    b, a = butter(2, [low, high], btype="bandpass")
+    padlen = 3 * (max(len(a), len(b)) - 1)
+    if len(sig) <= padlen:
+        return sig
+    return filtfilt(b, a, sig).astype(np.float32)
+
+
+def _estimate_bpm_snr(sig: np.ndarray, fps: float) -> tuple[float, float]:
+    if len(sig) < 16:
+        return 0.0, -np.inf
+    freqs, psd = welch(sig, fs=fps, nperseg=min(256, len(sig)))
+    band = (freqs >= 0.7) & (freqs <= 3.0)
+    if not np.any(band):
+        return 0.0, -np.inf
+    f_band = freqs[band]
+    p_band = psd[band]
+    peak_idx = int(np.argmax(p_band))
+    f0 = float(f_band[peak_idx])
+    bpm = f0 * 60.0
+    sig_band = band & (freqs >= f0 - 0.1) & (freqs <= f0 + 0.1)
+    noise_band = band & (~sig_band)
+    p_sig = float(np.sum(psd[sig_band])) + 1e-9
+    p_noise = float(np.sum(psd[noise_band])) + 1e-9
+    snr = 10.0 * math.log10(p_sig / p_noise)
+    return bpm, snr
+
+
+class InferenceWorker(threading.Thread):
+    """Threaded worker for Face Mesh tracking, SpecXNet inference, and POS rPPG."""
+
+    def __init__(self, device: torch.device) -> None:
+        super().__init__(daemon=True)
+        self._device = device
+        self._lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+        self._running = True
+        self._result: dict = {
+            "face_found": False,
+            "bbox": None,
+            "fake_prob": 0.5,
+            "fake_prob_smooth": 0.5,
+            "latency_ms": 0.0,
+            "waveform": np.zeros(120, dtype=np.float32),
+            "bpm": 0.0,
+            "snr": -np.inf,
+            "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
+            "status": "Scanning...",
+            "stability": 0.0,
+        }
+        self._model = build_specxnet(pretrained=True, device=device)
+        self._load_weights()
+        self._model.eval()
+        self._tasks_detector = None
+        self._tracker_mode = "center"
+        self._init_face_tracker()
+        self._fake_hist: deque[float] = deque(maxlen=5)
+        self._rgb_trace: deque[np.ndarray] = deque(maxlen=240)
+        self._fps_trace: deque[float] = deque(maxlen=50)
+
+    def _load_weights(self) -> None:
+        candidates = [
+            Path("weights/specxnet_best.pth"),
+            Path("weights/specxnet_latest.pth"),
+            Path("weights/specxnet_finetuned.pt"),
+        ]
+        for p in candidates:
+            if p.exists():
+                state = torch.load(p, map_location=self._device)
+                self._model.load_state_dict(state, strict=False)
+                print(f"[INFO] Loaded model weights: {p}")
+                return
+        print("[WARN] No fine-tuned SpecXNet weights found. Using backbone defaults.")
+
+    def update_frame(self, frame_bgr: np.ndarray) -> None:
+        with self._lock:
+            self._latest_frame = frame_bgr.copy()
+
+    def get_result(self) -> dict:
+        with self._lock:
+            out = dict(self._result)
+            out["waveform"] = self._result["waveform"].copy()
+            out["fft_thumb"] = self._result["fft_thumb"].copy()
+            return out
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        while self._running:
+            with self._lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+                self._latest_frame = None
+            if frame is None:
+                time.sleep(0.002)
+                continue
+            t0 = time.perf_counter()
+            res = self._process_frame(frame)
+            dt = max(time.perf_counter() - t0, 1e-6)
+            fps = 1.0 / dt
+            self._fps_trace.append(fps)
+            res["stability"] = float(np.std(np.asarray(self._fps_trace))) if len(self._fps_trace) > 3 else 0.0
+            res["latency_ms"] = dt * 1000.0
+            with self._lock:
+                self._result.update(res)
+        if self._tasks_detector is not None:
+            self._tasks_detector.close()
+
+    def _ensure_task_model(self) -> Path | None:
+        model_path = Path("weights/blaze_face_short_range.tflite")
+        if model_path.exists():
+            return model_path
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/face_detector/"
+            "blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
+        )
+        try:
+            print(f"[INFO] Downloading MediaPipe task model: {url}")
+            urllib.request.urlretrieve(url, str(model_path))
+            return model_path
+        except Exception as e:
+            print(f"[WARN] Failed to download task model, fallback to center ROI: {e}")
+            return None
+
+    def _init_face_tracker(self) -> None:
+        try:
+            if not hasattr(mp, "tasks"):
+                print("[WARN] mediapipe.tasks unavailable, fallback to center ROI tracker.")
+                return
+            model_path = self._ensure_task_model()
+            if model_path is None:
+                return
+            BaseOptions = mp.tasks.BaseOptions
+            vision = mp.tasks.vision
+            options = vision.FaceDetectorOptions(
+                base_options=BaseOptions(model_asset_path=str(model_path)),
+                min_detection_confidence=0.5,
+                running_mode=vision.RunningMode.IMAGE,
+            )
+            self._tasks_detector = vision.FaceDetector.create_from_options(options)
+            self._tracker_mode = "tasks_detector"
+            print("[INFO] Using mediapipe.tasks face detector.")
+        except Exception as e:
+            print(f"[WARN] Face tracker init failed, fallback to center ROI tracker: {e}")
+            self._tasks_detector = None
+            self._tracker_mode = "center"
+
+    def _detect_bbox_tasks(self, frame_bgr: np.ndarray) -> tuple[int, int, int, int] | None:
+        if self._tasks_detector is None:
+            return None
+        h, w = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        det_result = self._tasks_detector.detect(mp_image)
+        if not det_result.detections:
+            return None
+        best = max(det_result.detections, key=lambda d: d.categories[0].score if d.categories else 0.0)
+        bb = best.bounding_box
+        x0 = int(bb.origin_x)
+        y0 = int(bb.origin_y)
+        x1 = int(bb.origin_x + bb.width)
+        y1 = int(bb.origin_y + bb.height)
+        pad_x = int((x1 - x0) * 0.15)
+        pad_y = int((y1 - y0) * 0.20)
+        return _clamp_bbox(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y, w, h)
+
+    def _process_frame(self, frame_bgr: np.ndarray) -> dict:
+        h, w = frame_bgr.shape[:2]
+        if self._tracker_mode != "tasks_detector":
+            cx, cy = w // 2, h // 2
+            fw, fh = int(w * 0.34), int(h * 0.52)
+            x0, y0, x1, y1 = _clamp_bbox(cx - fw // 2, cy - fh // 2, cx + fw // 2, cy + fh // 2, w, h)
+            face = frame_bgr[y0:y1, x0:x1]
+            if face.size == 0:
+                pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
+                return {
+                    "face_found": False,
+                    "bbox": None,
+                    "fake_prob": 0.5,
+                    "fake_prob_smooth": 0.5,
+                    "waveform": np.zeros(120, dtype=np.float32),
+                    "bpm": 0.0,
+                    "snr": -np.inf,
+                    "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
+                    "status": "Scanning...",
+                    "scan_pulse": pulse,
+                }
+
+            # Use three center sub-ROIs to emulate forehead/cheek channels.
+            fh2, fw2 = face.shape[:2]
+            r_top = face[int(fh2 * 0.10) : int(fh2 * 0.34), int(fw2 * 0.25) : int(fw2 * 0.75)]
+            r_l = face[int(fh2 * 0.40) : int(fh2 * 0.78), int(fw2 * 0.08) : int(fw2 * 0.42)]
+            r_r = face[int(fh2 * 0.40) : int(fh2 * 0.78), int(fw2 * 0.58) : int(fw2 * 0.92)]
+            rois = [r for r in [r_top, r_l, r_r] if r.size > 0]
+            if not rois:
+                rgb_mean = np.zeros(3, dtype=np.float32)
+            else:
+                means = []
+                for r in rois:
+                    bgr = np.mean(r.reshape(-1, 3), axis=0)
+                    means.append(np.array([bgr[2], bgr[1], bgr[0]], dtype=np.float32))
+                rgb_mean = np.mean(np.stack(means, axis=0), axis=0)
+        else:
+            bbox = self._detect_bbox_tasks(frame_bgr)
+            if bbox is None:
+                pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
+                return {
+                    "face_found": False,
+                    "bbox": None,
+                    "fake_prob": 0.5,
+                    "fake_prob_smooth": 0.5,
+                    "waveform": np.zeros(120, dtype=np.float32),
+                    "bpm": 0.0,
+                    "snr": -np.inf,
+                    "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
+                    "status": "Scanning...",
+                    "scan_pulse": pulse,
+                }
+            x0, y0, x1, y1 = bbox
+            face = frame_bgr[y0:y1, x0:x1]
+            fh2, fw2 = face.shape[:2]
+            r_top = face[int(fh2 * 0.10) : int(fh2 * 0.34), int(fw2 * 0.25) : int(fw2 * 0.75)]
+            r_l = face[int(fh2 * 0.40) : int(fh2 * 0.78), int(fw2 * 0.08) : int(fw2 * 0.42)]
+            r_r = face[int(fh2 * 0.40) : int(fh2 * 0.78), int(fw2 * 0.58) : int(fw2 * 0.92)]
+            rois = [r for r in [r_top, r_l, r_r] if r.size > 0]
+            if not rois:
+                rgb_mean = np.zeros(3, dtype=np.float32)
+            else:
+                means = []
+                for r in rois:
+                    bgr = np.mean(r.reshape(-1, 3), axis=0)
+                    means.append(np.array([bgr[2], bgr[1], bgr[0]], dtype=np.float32))
+                rgb_mean = np.mean(np.stack(means, axis=0), axis=0)
+            face = frame_bgr[y0:y1, x0:x1]
+
+        if face.size == 0:
+            pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
+            return {
+                "face_found": False,
+                "bbox": None,
+                "fake_prob": 0.5,
+                "fake_prob_smooth": 0.5,
+                "waveform": np.zeros(120, dtype=np.float32),
+                "bpm": 0.0,
+                "snr": -np.inf,
+                "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
+                "status": "Scanning...",
+                "scan_pulse": pulse,
+            }
+        self._rgb_trace.append(rgb_mean)
+
+        face = _mcdm_preprocess_placeholder(face)
+        rgb_t = _to_model_tensor_rgb(face).to(self._device)
+        fft_t, fft_thumb_full = _to_model_tensor_fft(face)
+        fft_t = fft_t.to(self._device)
+        with torch.no_grad():
+            fake_prob = float(self._model(rgb_t, fft_t).item())
+        self._fake_hist.append(fake_prob)
+        fake_smooth = float(np.mean(self._fake_hist))
+
+        rgb_trace = np.asarray(self._rgb_trace, dtype=np.float32)
+        pos = _pos_signal(rgb_trace, fps=30.0)
+        pos_f = _filter_pos(pos, fps=30.0)
+        bpm, snr = _estimate_bpm_snr(pos_f, fps=30.0)
+        waveform = pos_f[-120:] if len(pos_f) > 0 else np.zeros(120, dtype=np.float32)
+        if len(waveform) < 120:
+            waveform = np.pad(waveform, (120 - len(waveform), 0))
+
+        status = "Safe"
+        if fake_smooth >= 0.65:
+            status = "Purifying"
+        elif fake_smooth >= 0.45:
+            status = "Caution"
+
+        return {
+            "face_found": True,
+            "bbox": (x0, y0, x1, y1),
+            "fake_prob": fake_prob,
+            "fake_prob_smooth": fake_smooth,
+            "waveform": waveform.astype(np.float32),
+            "bpm": bpm,
+            "snr": snr,
+            "fft_thumb": cv2.resize(fft_thumb_full, (64, 64), interpolation=cv2.INTER_AREA),
+            "status": status,
+            "scan_pulse": 1.0,
+        }
+
+
+def _draw_glass_panel(img: np.ndarray, x0: int, y0: int, x1: int, y1: int, alpha: float = 0.72) -> None:
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (30, 32, 36), -1)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0.0, img)
+    cv2.rectangle(img, (x0, y0), (x1, y1), SOFT_WHITE, 1)
+
+
+def _draw_ring_progress(img: np.ndarray, center: tuple[int, int], radius: int, score: float) -> None:
+    score = float(np.clip(score, 0.0, 1.0))
+    safe = np.array(PASTEL_BLUE, dtype=np.float32)
+    danger = np.array(SOFT_PINK, dtype=np.float32)
+    color_arr = safe * (1.0 - score) + danger * score
+    color = tuple(int(c) for c in color_arr)
+    cv2.circle(img, center, radius, (70, 72, 78), 10)
+    end_angle = int(360 * score)
+    cv2.ellipse(img, center, (radius, radius), -90, 0, end_angle, color, 10)
+    cv2.putText(img, f"{score:.2f}", (center[0] - 28, center[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BEIGE, 2)
+
+
+def _draw_waveform(img: np.ndarray, wave: np.ndarray, rect: tuple[int, int, int, int]) -> None:
+    x0, y0, x1, y1 = rect
+    _draw_glass_panel(img, x0, y0, x1, y1, alpha=0.66)
+    if len(wave) < 2:
+        return
+    w = x1 - x0 - 12
+    h = y1 - y0 - 18
+    pts = []
+    wv = wave.copy()
+    wv = (wv - np.min(wv)) / (np.max(wv) - np.min(wv) + 1e-6)
+    for i, v in enumerate(wv):
+        px = x0 + 6 + int(i * w / max(len(wv) - 1, 1))
+        py = y0 + 8 + int((1.0 - v) * h)
+        pts.append((px, py))
+    cv2.polylines(img, [np.asarray(pts, dtype=np.int32)], False, PASTEL_BLUE, 2)
+    cv2.putText(img, "Live rPPG", (x0 + 8, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BEIGE, 1)
+
+
+def draw_console(
     fps: float,
+    latency_ms: float,
+    stability: float,
+    bpm: float,
+    fake_score: float,
     status: str,
-    detector_type: str,
+    waveform: np.ndarray,
+    fft_thumb: np.ndarray,
+    face_found: bool,
+    scan_pulse: float,
 ) -> np.ndarray:
-    """Render right-side panel and return final composited frame."""
-    h, _ = frame.shape[:2]
-    panel = np.zeros((h, PANEL_WIDTH, 3), dtype=np.uint8)
-    panel[:] = (28, 26, 24)
+    panel = np.zeros((PANEL_HEIGHT, PANEL_WIDTH, 3), dtype=np.uint8)
+    _draw_glass_panel(panel, 6, 6, PANEL_WIDTH - 7, PANEL_HEIGHT - 7, alpha=0.72)
 
-    # Semi-transparent style.
-    blended = cv2.addWeighted(panel, 0.68, np.full_like(panel, (52, 46, 42)), 0.32, 0.0)
+    cv2.putText(panel, "PREVERVECT", (22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.95, BEIGE, 2)
+    cv2.putText(panel, "Research Defense Dashboard", (22, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.5, SOFT_WHITE, 1)
 
-    text_primary = (210, 230, 240)
-    text_soft = (190, 205, 215)
-    bar_bg = (70, 74, 82)
-    bar_fg = (120, 210, 255)
+    _draw_ring_progress(panel, (92, 150), 46, fake_score)
+    cv2.putText(panel, "Fake Score", (45, 218), cv2.FONT_HERSHEY_SIMPLEX, 0.52, SOFT_WHITE, 1)
 
-    cv2.putText(blended, "PREVERVECT", (20, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.9, text_primary, 2)
-    cv2.putText(blended, "Realtime Defense Console", (20, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_soft, 1)
+    thumb_rect = (PANEL_WIDTH - 96, 120, PANEL_WIDTH - 32, 184)
+    _draw_glass_panel(panel, thumb_rect[0] - 4, thumb_rect[1] - 4, thumb_rect[2] + 4, thumb_rect[3] + 4, alpha=0.60)
+    panel[thumb_rect[1] : thumb_rect[3], thumb_rect[0] : thumb_rect[2]] = fft_thumb
+    cv2.putText(panel, "FFT", (thumb_rect[0] + 16, thumb_rect[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, SOFT_WHITE, 1)
 
-    cv2.putText(blended, "Trust Score", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_primary, 1)
-    bx0, by0, bx1, by1 = 20, 125, PANEL_WIDTH - 20, 150
-    cv2.rectangle(blended, (bx0, by0), (bx1, by1), bar_bg, -1)
-    fill_w = int((bx1 - bx0) * float(np.clip(trust_score, 0.0, 1.0)))
-    cv2.rectangle(blended, (bx0, by0), (bx0 + fill_w, by1), bar_fg, -1)
-    cv2.putText(blended, f"{trust_score:.3f}", (bx1 - 90, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_primary, 1)
+    _draw_waveform(panel, waveform, (24, 242, PANEL_WIDTH - 24, 332))
 
-    cv2.putText(blended, f"FPS: {fps:5.1f}", (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_primary, 1)
-    cv2.putText(blended, f"Status: {status}", (20, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.62, text_primary, 1)
-    cv2.putText(blended, f"Detector: {detector_type}", (20, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.58, text_soft, 1)
-    cv2.putText(blended, "Press q to quit", (20, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, text_soft, 1)
+    gx0, gy0 = 24, 352
+    gx1, gy1 = PANEL_WIDTH - 24, 470
+    _draw_glass_panel(panel, gx0, gy0, gx1, gy1, alpha=0.66)
+    midx = (gx0 + gx1) // 2
+    midy = (gy0 + gy1) // 2
+    cv2.line(panel, (midx, gy0), (midx, gy1), (120, 125, 132), 1)
+    cv2.line(panel, (gx0, midy), (gx1, midy), (120, 125, 132), 1)
+    cv2.putText(panel, "FPS", (gx0 + 16, gy0 + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.54, SOFT_WHITE, 1)
+    cv2.putText(panel, f"{fps:4.1f}", (gx0 + 16, gy0 + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
 
-    return np.hstack([frame, blended])
+    cv2.putText(panel, "Latency", (midx + 12, gy0 + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.54, SOFT_WHITE, 1)
+    cv2.putText(panel, f"{latency_ms:5.1f} ms", (midx + 12, gy0 + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
+
+    cv2.putText(panel, "Stability", (gx0 + 16, midy + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.54, SOFT_WHITE, 1)
+    cv2.putText(panel, f"{stability:4.2f}", (gx0 + 16, midy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
+
+    cv2.putText(panel, "Heart Rate", (midx + 12, midy + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.54, SOFT_WHITE, 1)
+    cv2.putText(panel, f"{bpm:5.1f} BPM", (midx + 12, midy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
+
+    pulse = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(time.time() * 2.5))
+    if status == "Purifying":
+        glow = tuple(int(c * pulse) for c in SOFT_PINK)
+    elif not face_found:
+        glow = tuple(int(c * scan_pulse) for c in PASTEL_BLUE)
+    else:
+        glow = SOFT_WHITE
+    cv2.putText(panel, f"Status: {status}", (24, 510), cv2.FONT_HERSHEY_SIMPLEX, 0.68, glow, 2)
+    cv2.putText(panel, "Press q to quit", (24, 536), cv2.FONT_HERSHEY_SIMPLEX, 0.52, SOFT_WHITE, 1)
+    return panel
+
+
+def _to_live_thumbnail(frame: np.ndarray, max_width: int = 760, max_height: int = 420) -> np.ndarray:
+    h, w = frame.shape[:2]
+    scale = min(max_width / max(w, 1), max_height / max(h, 1), 1.0)
+    return cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+
+
+def _make_session_logger(log_dir: Path) -> tuple[csv.DictWriter, object]:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = log_dir / f"session_{ts}.csv"
+    f = path.open("w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(f, fieldnames=["time_sec", "fps", "latency_ms", "bpm", "snr_db", "fake_score"])
+    writer.writeheader()
+    print(f"[INFO] Session log: {path}")
+    return writer, f
 
 
 def main() -> None:
     args = _parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(device)
-    detector_type, detector_obj = _create_face_detector()
+    worker = InferenceWorker(device=device)
+    worker.start()
+    logger, log_fp = _make_session_logger(args.log_dir)
 
     with mss.mss() as sct:
         monitor = _get_monitor_from_window_title(args.target_window)
         if monitor is None:
-            # fallback to previous manual region
             monitor = {"top": 120, "left": 160, "width": 1280, "height": 720}
 
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        # Move preview window away from capture region to avoid recursion.
-        display_x = monitor["left"] + monitor["width"] + 30
-        display_y = max(40, monitor["top"])
-        cv2.moveWindow(WINDOW_NAME, display_x, display_y)
+        cv2.namedWindow(LIVE_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(CONSOLE_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(LIVE_WINDOW_NAME, 760, 420)
+        cv2.resizeWindow(CONSOLE_WINDOW_NAME, PANEL_WIDTH, PANEL_HEIGHT)
+        cv2.moveWindow(LIVE_WINDOW_NAME, 30, 40)
+        cv2.moveWindow(CONSOLE_WINDOW_NAME, 840, 40)
+        try:
+            cv2.setWindowProperty(CONSOLE_WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+        except Exception:
+            pass
 
-        prev = time.time()
+        fps_hist: deque[float] = deque(maxlen=40)
+        prev = time.perf_counter()
+        last_log_t = 0.0
         while True:
             shot = sct.grab(monitor)
-            # Convert via OpenCV to keep a contiguous/writeable array for drawing APIs.
             frame = cv2.cvtColor(np.array(shot, dtype=np.uint8), cv2.COLOR_BGRA2BGR)
-            _draw_capture_guide(frame)
-            bbox = _detect_face_bbox(frame, detector_type, detector_obj)
+            worker.update_frame(frame)
+            result = worker.get_result()
 
-            trust_score = 0.5
-            status = "Analyzing"
-
-            if bbox is not None:
-                x0, y0, x1, y1 = bbox
-                face_roi = frame[y0:y1, x0:x1]
-                if face_roi.size > 0:
-                    face_roi_mcdm = _mcdm_preprocess_placeholder(face_roi)
-                    rgb_tensor = bgr_to_tensor(face_roi_mcdm).to(device)
-                    fft_tensor = fft_to_tensor(face_roi_mcdm).to(device)
-                    with torch.no_grad():
-                        fake_prob = model(rgb_tensor, fft_tensor).item()
-
-                    # Define trust score as "realness" for intuitive UI.
-                    trust_score = float(1.0 - fake_prob)
-                    if trust_score < 0.40:
-                        status = "Warning"
-                    elif trust_score < 0.65:
-                        status = "Purifying"
-                    else:
-                        status = "Analyzing"
-
-                    color = (80, 220, 140) if trust_score >= 0.5 else (40, 80, 240)
-                    cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
-            else:
-                status = "Analyzing"
-
-            now = time.time()
+            now = time.perf_counter()
             fps = 1.0 / max(now - prev, 1e-6)
             prev = now
+            fps_hist.append(fps)
+            fps_stability = float(np.std(np.asarray(fps_hist))) if len(fps_hist) > 2 else 0.0
 
-            composed = _render_overlay_panel(frame, trust_score, fps, status, detector_type)
-            cv2.imshow(WINDOW_NAME, composed)
+            if result["face_found"] and result["bbox"] is not None:
+                x0, y0, x1, y1 = result["bbox"]
+                color = SOFT_PINK if result["fake_prob_smooth"] >= 0.5 else SOFT_WHITE
+                cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
+            else:
+                pulse = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
+                txt_color = tuple(int(c * pulse) for c in PASTEL_BLUE)
+                cv2.putText(frame, "Scanning...", (30, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.0, txt_color, 2)
+
+            live_thumb = _to_live_thumbnail(frame)
+            console = draw_console(
+                fps=fps,
+                latency_ms=float(result["latency_ms"]),
+                stability=fps_stability,
+                bpm=float(result["bpm"]),
+                fake_score=float(result["fake_prob_smooth"]),
+                status=str(result["status"]),
+                waveform=result["waveform"],
+                fft_thumb=result["fft_thumb"],
+                face_found=bool(result["face_found"]),
+                scan_pulse=float(result.get("scan_pulse", 1.0)),
+            )
+            cv2.imshow(LIVE_WINDOW_NAME, live_thumb)
+            cv2.imshow(CONSOLE_WINDOW_NAME, console)
+
+            t = time.time()
+            if t - last_log_t >= 1.0:
+                logger.writerow(
+                    {
+                        "time_sec": f"{t:.3f}",
+                        "fps": f"{fps:.3f}",
+                        "latency_ms": f"{float(result['latency_ms']):.3f}",
+                        "bpm": f"{float(result['bpm']):.3f}",
+                        "snr_db": f"{float(result['snr']):.3f}",
+                        "fake_score": f"{float(result['fake_prob_smooth']):.6f}",
+                    }
+                )
+                log_fp.flush()
+                last_log_t = t
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-    if detector_type == "mediapipe":
-        detector_obj.close()
+    worker.stop()
+    worker.join(timeout=1.0)
+    log_fp.close()
     cv2.destroyAllWindows()
 
 

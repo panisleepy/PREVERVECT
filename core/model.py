@@ -22,8 +22,33 @@ class SpecXNetConfig:
 
     backbone_name: str = "efficientnet_b0"
     pretrained: bool = True
-    dropout: float = 0.2
+    dropout: float = 0.5
     num_classes: int = 1
+
+
+def _kaiming_init_module(m: nn.Module) -> None:
+    """Kaiming normal for Conv2d / Linear (bias zero). Used on heads; optional full backbone when not pretrained."""
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Linear):
+        nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
+def init_specxnet_weights(model: "SpecXNet", pretrained_backbones: bool) -> None:
+    """
+    Apply Kaiming init to DFA + classifier always.
+    If backbones are not pretrained, also re-init all conv/linear inside both encoders.
+    Pretrained timm weights are kept when ``pretrained_backbones`` is True.
+    """
+    model.dfa.apply(_kaiming_init_module)
+    model.classifier.apply(_kaiming_init_module)
+    if not pretrained_backbones:
+        model.spatial_backbone.apply(_kaiming_init_module)
+        model.freq_backbone.apply(_kaiming_init_module)
 
 
 class DualStreamFeatureAggregation(nn.Module):
@@ -37,19 +62,27 @@ class DualStreamFeatureAggregation(nn.Module):
     def __init__(self, feature_dim: int) -> None:
         super().__init__()
         hidden = max(feature_dim // 2, 64)
-        self.gate_mlp = nn.Sequential(
+        self.attn_mlp = nn.Sequential(
             nn.Linear(feature_dim * 2, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 2),
-            nn.Sigmoid(),
         )
 
-    def forward(self, spatial_feat: torch.Tensor, freq_feat: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        spatial_feat: torch.Tensor,
+        freq_feat: torch.Tensor,
+        return_weights: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         concat = torch.cat([spatial_feat, freq_feat], dim=1)  # [B, 2D]
-        gates = self.gate_mlp(concat)  # [B, 2], in [0, 1]
+        # Per-sample cross-stream attention. We use softmax to keep the two
+        # stream weights normalized and directly interpretable.
+        gates = torch.softmax(self.attn_mlp(concat), dim=1)  # [B, 2], sums to 1
         w_spatial = gates[:, 0:1]
         w_freq = gates[:, 1:2]
         fused = w_spatial * spatial_feat + w_freq * freq_feat
+        if return_weights:
+            return fused, gates
         return fused
 
 
@@ -90,12 +123,14 @@ class SpecXNet(nn.Module):
             nn.Dropout(p=self.cfg.dropout),
             nn.Linear(feature_dim, self.cfg.num_classes),
         )
+        init_specxnet_weights(self, pretrained_backbones=self.cfg.pretrained)
 
     def forward(
         self,
         rgb: torch.Tensor,
         fft: torch.Tensor,
         return_logits: bool = False,
+        return_fusion_weights: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for dual-stream inference.
@@ -107,11 +142,20 @@ class SpecXNet(nn.Module):
         """
         spatial_feat = self.spatial_backbone(rgb)  # [B, D]
         freq_feat = self.freq_backbone(fft)  # [B, D]
-        fused_feat = self.dfa(spatial_feat, freq_feat)  # [B, D]
+        dfa_out = self.dfa(
+            spatial_feat,
+            freq_feat,
+            return_weights=return_fusion_weights,
+        )
+        if return_fusion_weights:
+            fused_feat, gates = dfa_out
+        else:
+            fused_feat = dfa_out
         logits = self.classifier(fused_feat)  # [B, 1]
-        if return_logits:
-            return logits
-        return torch.sigmoid(logits)
+        output = logits if return_logits else torch.sigmoid(logits)
+        if return_fusion_weights:
+            return output, gates
+        return output
 
 
 def build_specxnet(

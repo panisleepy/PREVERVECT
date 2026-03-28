@@ -55,12 +55,37 @@ def collect_videos(data_root: Path) -> list[Path]:
     return [p for p in data_root.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
 
 
+def cleanup_temp_frames(data_root: Path, verbose: bool = False) -> int:
+    """
+    Remove temporary frame/image caches to keep dataset folder clean.
+    Returns deleted file count.
+    """
+    if not data_root.exists():
+        return 0
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    deleted = 0
+    for p in data_root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            parent = str(p.parent).lower()
+            if "tmp" in parent or "temp" in parent or "cache" in parent or "frames" in parent:
+                try:
+                    p.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+    if verbose:
+        print(f"[CLEANUP] Deleted {deleted} temporary frame files under: {data_root}")
+    return deleted
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract FaceForensics++ frames into Real/Fake folders.")
     parser.add_argument("--data_root", type=Path, required=True, help="Path to FaceForensics++ root.")
     parser.add_argument("--output_root", type=Path, default=Path("data/frames"), help="Output root for extracted frames.")
     parser.add_argument("--every_n", type=int, default=10, help="Save one frame every N frames.")
     parser.add_argument("--max_frames", type=int, default=0, help="Max frames per video, 0 means unlimited.")
+    parser.add_argument("--cleanup", action="store_true", help="Cleanup temporary frame caches after processing.")
     args = parser.parse_args()
 
     videos = collect_videos(args.data_root)
@@ -75,6 +100,8 @@ def main() -> None:
         print(f"[{i}/{len(videos)}] {video.name} -> {n} frames")
 
     print(f"[DONE] Extracted {total} frames from {len(videos)} videos into: {args.output_root}")
+    if args.cleanup:
+        cleanup_temp_frames(args.output_root, verbose=True)
 
 
 if __name__ == "__main__":
