@@ -13,7 +13,7 @@
 5. [即時偵測器 `capture/screen_detector.py`](#5-即時偵測器-capturescreen_detectorpy)
 6. [rPPG 研究管線](#6-rppg-研究管線)
 7. [專案目錄結構](#7-專案目錄結構)
-8. [環境與快速指令](#8-環境與快速指令)
+8. [從另一台電腦取得專案與執行（含 venv）](#8-從另一台電腦取得專案與執行含-venv)
 
 ---
 
@@ -93,7 +93,7 @@
 
 ### 5.1 執行方式
 
-在專案根目錄、啟用 venv 後：
+在專案根目錄、啟用 venv 後（完整指令見 [§8](#8-從另一台電腦取得專案與執行含-venv)）：
 
 ```bash
 python capture/screen_detector.py
@@ -161,33 +161,128 @@ PREVERVECT/
 
 ---
 
-## 8. 環境與快速指令
+## 8. 從另一台電腦取得專案與執行（含 venv）
 
-### 8.1 安裝
+### 8.1 取得程式碼
+
+**方式 A：Git（推薦）**
+
+將 `YOUR_REPO_URL` 換成你的 GitHub 儲存庫網址。
 
 ```bash
+git clone https://github.com/YOUR_USER/PREVERVECT.git
+cd PREVERVECT
+```
+
+**方式 B：ZIP**
+
+在 GitHub 網頁 **Code → Download ZIP**，解壓後進入資料夾（內容應含 `core/`、`capture/`、`requirements.txt`）。
+
+> **注意**：`.gitignore` 通常會排除 `weights/*.pth`、`raw_data/`。新電腦上不會自動有 **訓練好的權重**；請自行從雲端硬碟／隨身碟複製 `specxnet_best.pth` 到專案下的 `weights/`（見 §8.3）。
+
+---
+
+### 8.2 建立虛擬環境並安裝依賴
+
+**Windows（PowerShell）**（請先 `cd` 到專案根目錄 `PREVERVECT`）：
+
+```powershell
 python -m venv venv
-# Windows: venv\Scripts\activate
+.\venv\Scripts\Activate.ps1
+pip install -U pip
 pip install -r requirements.txt
 ```
 
-### 8.2 訓練（範例）
+若執行政策擋住啟用腳本，可先執行：`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
+
+**Linux / macOS（bash）**：
 
 ```bash
-python core/train.py ^
-  --real_dir raw_data/original_sequences/youtube/c23/videos ^
-  --fake_dir raw_data/manipulated_sequences/Deepfakes/c23/videos ^
-  --save_dir weights ^
+python3 -m venv venv
+source venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+之後每次開新終端機要先 **啟用同一個 venv**，再執行下面各節的 `python ...` 指令。
+
+---
+
+### 8.3 要不要「訓練過的模型」？
+
+| 你想做的事 | 是否需要 `specxnet_best.pth`（或自訓權重）？ |
+|------------|-------------------------------------------|
+| **只跑 UI、看擷取／人臉框／rPPG 波形、測流程** | **不需要**。未提供權重時會用 ImageNet 預訓練骨干 + 未訓練的頭，**Fake 分數不可靠**。 |
+| **認真做 Deepfake 分數（Fake Score）** | **需要**。將權重放在 `weights/specxnet_best.pth`，或用 `--weights` 指到完整路徑。 |
+| **自己訓練新權重** | 需要 **影片資料集** + 執行 `core/train.py`（§8.5），產出新的 `.pth`。 |
+
+---
+
+### 8.4 即時偵測器（在專案根目錄、已 `activate` venv）
+
+**不帶自訓權重（僅測管線）**：
+
+```powershell
+python capture\screen_detector.py
+```
+
+**使用訓練權重（建議）**：
+
+```powershell
+python capture\screen_detector.py --weights weights\specxnet_best.pth
+```
+
+**只擷取標題含某關鍵字的視窗（例如瀏覽器）**：
+
+```powershell
+python capture\screen_detector.py --weights weights\specxnet_best.pth --target_window "Chrome"
+```
+
+結束：在 OpenCV 視窗按 **`q`**。
+
+---
+
+### 8.5 訓練 SpecXNet（需要 Real / Fake 影片目錄）
+
+先準備好資料路徑（範例為 FaceForensics++ 風格），在專案根目錄執行：
+
+**PowerShell：**
+
+```powershell
+python core\train.py `
+  --real_dir "raw_data\original_sequences\youtube\c23\videos" `
+  --fake_dir "raw_data\manipulated_sequences\Deepfakes\c23\videos" `
+  --save_dir "weights" `
+  --epochs 20 `
+  --batch_size 16 `
+  --num_workers 4
+```
+
+**bash：**
+
+```bash
+python core/train.py \
+  --real_dir raw_data/original_sequences/youtube/c23/videos \
+  --fake_dir raw_data/manipulated_sequences/Deepfakes/c23/videos \
+  --save_dir weights \
   --epochs 20 --batch_size 16 --num_workers 4
 ```
 
-### 8.3 即時偵測
+訓練完成後使用 **`weights/specxnet_best.pth`**（驗證集最佳），再依 §8.4 跑偵測器。
 
-```bash
-python capture/screen_detector.py --weights weights/specxnet_best.pth
+---
+
+### 8.6 離線 rPPG 管線（可選，需影片與路徑自調）
+
+```powershell
+python run_rppg_pipeline.py
 ```
 
-### 8.4 依賴重點
+實際參數請依 `run_rppg_pipeline.py`、`advanced_extractor.py` 內的 `argparse` 為準。
+
+---
+
+### 8.7 依賴重點
 
 - **PyTorch / torchvision / timm**：模型與訓練。
 - **OpenCV**：影像與 UI。
@@ -200,4 +295,4 @@ python capture/screen_detector.py --weights weights/specxnet_best.pth
 
 ## 版本說明
 
-本 README 描述的是目前儲存庫中的 **設計與實作要點**；實際數值（閾值、epoch、資料路徑）可能因實驗而調整，請以程式碼與 `argparse` 說明為準。若在另一台電腦僅需閱讀架構，將本檔與 `core/`、`capture/` 一併複製即可對照；完整重現需 **Python 環境、權重檔與（若訓練）資料集**。
+本 README 描述的是目前儲存庫中的 **設計與實作要點**；實際數值（閾值、epoch、資料路徑）可能因實驗而調整，請以程式碼與 `argparse` 說明為準。從另一台電腦 **clone / 下載 ZIP** 後，務必 **建立 venv、安裝 `requirements.txt`**，並依需求 **自行放入 `weights/specxnet_best.pth`** 或執行訓練。
