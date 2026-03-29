@@ -34,6 +34,17 @@ PANEL_WIDTH = 430
 PANEL_HEIGHT = 560
 MODEL_SIZE = 224
 
+# Scoring: linear calibration reduces oversensitivity to fakes (clip 0–1).
+SCORE_CALIB_OFFSET = 0.3
+SCORE_CALIB_DIV = 0.7
+SCORE_SMOOTH_LEN = 15
+
+# Laplacian variance (focus); below → low quality → force 50/50 DFA fusion.
+LAPLACIAN_VAR_THRESHOLD = 120.0
+
+# BPM: SNR = energy near 1.2 Hz / energy in rest of 0.5–4 Hz band; below → unreliable.
+BPM_SNR_12HZ_THRESHOLD = 1.5
+
 # Palette: #FFD1DC, #AEC6CF, #F5F5DC in BGR.
 SOFT_PINK = (220, 209, 255)
 PASTEL_BLUE = (207, 198, 174)
@@ -49,6 +60,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Realtime PREVERVECT screen detector")
     parser.add_argument("--target_window", type=str, default="", help="Window title keyword to capture.")
     parser.add_argument("--log_dir", type=Path, default=Path("logs"), help="Session CSV output folder.")
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        default=None,
+        help="SpecXNet state_dict (.pth). If omitted, tries weights/specxnet_best.pth under project root.",
+    )
     return parser.parse_args()
 
 
@@ -71,6 +88,42 @@ def _get_monitor_from_window_title(title_keyword: str) -> dict[str, int] | None:
 
 def _mcdm_preprocess_placeholder(face_roi: np.ndarray) -> np.ndarray:
     return face_roi
+
+
+def _calibrate_fake_score(raw: float) -> float:
+    x = (float(raw) - SCORE_CALIB_OFFSET) / SCORE_CALIB_DIV
+    return float(np.clip(x, 0.0, 1.0))
+
+
+def _unsharp_mask_bgr(bgr: np.ndarray, amount: float = 0.85, sigma: float = 1.2) -> np.ndarray:
+    if bgr.size == 0:
+        return bgr
+    blurred = cv2.GaussianBlur(bgr, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    sharp = cv2.addWeighted(bgr, 1.0 + amount, blurred, -amount, 0.0)
+    return np.clip(sharp, 0, 255).astype(np.uint8)
+
+
+def _laplacian_var_bgr(bgr: np.ndarray) -> float:
+    if bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _expand_bbox_scale(
+    x0: int, y0: int, x1: int, y1: int, w: int, h: int, scale: float = 1.2
+) -> tuple[int, int, int, int]:
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    bw = float(x1 - x0)
+    bh = float(y1 - y0)
+    nw = bw * scale
+    nh = bh * scale
+    x0n = int(round(cx - nw * 0.5))
+    y0n = int(round(cy - nh * 0.5))
+    x1n = int(round(cx + nw * 0.5))
+    y1n = int(round(cy + nh * 0.5))
+    return _clamp_bbox(x0n, y0n, x1n, y1n, w, h)
 
 
 def _clamp_bbox(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -107,7 +160,10 @@ def _weighted_mean_rgb(frame_bgr: np.ndarray, poly: np.ndarray) -> tuple[float, 
 
 
 def _to_model_tensor_rgb(face_bgr: np.ndarray) -> torch.Tensor:
-    resized = cv2.resize(face_bgr, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+    # Match core/dataloader VideoFramePairDataset: ToTensor → Resize 224 → ImageNet normalize.
+    h, w = face_bgr.shape[:2]
+    interp = cv2.INTER_AREA if h >= MODEL_SIZE and w >= MODEL_SIZE else cv2.INTER_LINEAR
+    resized = cv2.resize(face_bgr, (MODEL_SIZE, MODEL_SIZE), interpolation=interp)
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -117,7 +173,9 @@ def _to_model_tensor_rgb(face_bgr: np.ndarray) -> torch.Tensor:
 
 def _to_model_tensor_fft(face_bgr: np.ndarray) -> tuple[torch.Tensor, np.ndarray]:
     spec = power_spectrum_shifted_bgr(face_bgr)
-    spec_resized = cv2.resize(spec, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    sh, sw = spec.shape[:2]
+    interp = cv2.INTER_AREA if sh >= MODEL_SIZE and sw >= MODEL_SIZE else cv2.INTER_LINEAR
+    spec_resized = cv2.resize(spec, (MODEL_SIZE, MODEL_SIZE), interpolation=interp).astype(np.float32)
     norm = (spec_resized - 0.5) / 0.5
     tensor = torch.from_numpy(np.transpose(norm, (2, 0, 1))).unsqueeze(0)
     thumb = (spec_resized * 255.0).clip(0, 255).astype(np.uint8)
@@ -165,13 +223,20 @@ def _filter_pos(sig: np.ndarray, fps: float) -> np.ndarray:
     return filtfilt(b, a, sig).astype(np.float32)
 
 
-def _estimate_bpm_snr(sig: np.ndarray, fps: float) -> tuple[float, float]:
-    if len(sig) < 16:
-        return 0.0, -np.inf
-    freqs, psd = welch(sig, fs=fps, nperseg=min(256, len(sig)))
+def _estimate_bpm_and_snr_metrics(
+    sig: np.ndarray, fs: float
+) -> tuple[float, float, float, bool]:
+    """
+    BPM from Welch peak in 0.7–3 Hz; welch_snr_db = 10*log10(peak band / rest in HR band);
+    snr_12hz_ratio = P(1.1–1.3 Hz) / (P(0.5–4 Hz) - P(1.1–1.3 Hz)); reliable if ratio >= threshold.
+    """
+    if len(sig) < 16 or fs < 1e-3:
+        return 0.0, -np.inf, 0.0, False
+    nperseg = min(256, len(sig))
+    freqs, psd = welch(sig, fs=fs, nperseg=nperseg)
     band = (freqs >= 0.7) & (freqs <= 3.0)
     if not np.any(band):
-        return 0.0, -np.inf
+        return 0.0, -np.inf, 0.0, False
     f_band = freqs[band]
     p_band = psd[band]
     peak_idx = int(np.argmax(p_band))
@@ -181,28 +246,42 @@ def _estimate_bpm_snr(sig: np.ndarray, fps: float) -> tuple[float, float]:
     noise_band = band & (~sig_band)
     p_sig = float(np.sum(psd[sig_band])) + 1e-9
     p_noise = float(np.sum(psd[noise_band])) + 1e-9
-    snr = 10.0 * math.log10(p_sig / p_noise)
-    return bpm, snr
+    welch_snr_db = 10.0 * math.log10(p_sig / p_noise)
+
+    band_full = (freqs >= 0.5) & (freqs <= 4.0)
+    p_full = float(np.sum(psd[band_full])) + 1e-12
+    band_12 = (freqs >= 1.1) & (freqs <= 1.3)
+    p_12 = float(np.sum(psd[band_12]))
+    rest = max(p_full - p_12, 1e-12)
+    snr_12hz_ratio = p_12 / rest
+    is_reliable = snr_12hz_ratio >= BPM_SNR_12HZ_THRESHOLD
+    return bpm, welch_snr_db, snr_12hz_ratio, is_reliable
 
 
 class InferenceWorker(threading.Thread):
     """Threaded worker for Face Mesh tracking, SpecXNet inference, and POS rPPG."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, weights_path: Path | None = None) -> None:
         super().__init__(daemon=True)
         self._device = device
+        self._weights_path = weights_path
         self._lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
         self._running = True
         self._result: dict = {
             "face_found": False,
             "bbox": None,
+            "raw_fake_score": 0.5,
+            "calib_fake_score": _calibrate_fake_score(0.5),
+            "avg_fake_score": 0.5,
             "fake_prob": 0.5,
             "fake_prob_smooth": 0.5,
             "latency_ms": 0.0,
             "waveform": np.zeros(120, dtype=np.float32),
             "bpm": 0.0,
             "snr": -np.inf,
+            "snr_12hz_ratio": 0.0,
+            "is_bpm_reliable": False,
             "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
             "status": "Scanning...",
             "stability": 0.0,
@@ -213,19 +292,46 @@ class InferenceWorker(threading.Thread):
         self._tasks_detector = None
         self._tracker_mode = "center"
         self._init_face_tracker()
-        self._fake_hist: deque[float] = deque(maxlen=5)
+        self._calib_hist: deque[float] = deque(maxlen=SCORE_SMOOTH_LEN)
         self._rgb_trace: deque[np.ndarray] = deque(maxlen=240)
         self._fps_trace: deque[float] = deque(maxlen=50)
+        self._frame_dt_hist: deque[float] = deque(maxlen=90)
+        self._last_frame_arrival_t: float | None = None
 
     def _load_weights(self) -> None:
-        candidates = [
-            Path("weights/specxnet_best.pth"),
-            Path("weights/specxnet_latest.pth"),
-            Path("weights/specxnet_finetuned.pt"),
-        ]
+        candidates: list[Path] = []
+        if self._weights_path is not None:
+            wp = Path(self._weights_path)
+            if wp.is_absolute():
+                candidates.append(wp)
+            else:
+                candidates.append(PROJECT_ROOT / wp)
+                candidates.append(Path.cwd() / wp)
+        candidates.extend(
+            [
+                PROJECT_ROOT / "weights/specxnet_best.pth",
+                PROJECT_ROOT / "weights/specxnet_latest.pth",
+                PROJECT_ROOT / "weights/specxnet_finetuned.pt",
+                Path("weights/specxnet_best.pth"),
+                Path("weights/specxnet_latest.pth"),
+                Path("weights/specxnet_finetuned.pt"),
+            ]
+        )
+        seen: set[str] = set()
         for p in candidates:
-            if p.exists():
-                state = torch.load(p, map_location=self._device)
+            try:
+                p = p.resolve()
+            except OSError:
+                continue
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            if p.is_file():
+                try:
+                    state = torch.load(p, map_location=self._device, weights_only=True)
+                except TypeError:
+                    state = torch.load(p, map_location=self._device)
                 self._model.load_state_dict(state, strict=False)
                 print(f"[INFO] Loaded model weights: {p}")
                 return
@@ -253,8 +359,20 @@ class InferenceWorker(threading.Thread):
             if frame is None:
                 time.sleep(0.002)
                 continue
+            t_arrival = time.perf_counter()
+            if self._last_frame_arrival_t is not None:
+                dtf = t_arrival - self._last_frame_arrival_t
+                if dtf > 1e-4:
+                    self._frame_dt_hist.append(dtf)
+            self._last_frame_arrival_t = t_arrival
+            fs_sample = 30.0
+            if len(self._frame_dt_hist) >= 5:
+                mean_dt = float(np.mean(self._frame_dt_hist))
+                fs_sample = 1.0 / max(mean_dt, 1e-3)
+                fs_sample = float(np.clip(fs_sample, 8.0, 120.0))
+
             t0 = time.perf_counter()
-            res = self._process_frame(frame)
+            res = self._process_frame(frame, fs_sample=fs_sample)
             dt = max(time.perf_counter() - t0, 1e-6)
             fps = 1.0 / dt
             self._fps_trace.append(fps)
@@ -305,6 +423,11 @@ class InferenceWorker(threading.Thread):
             self._tasks_detector = None
             self._tracker_mode = "center"
 
+    def _avg_calib(self) -> float:
+        if not self._calib_hist:
+            return 0.5
+        return float(np.mean(self._calib_hist))
+
     def _detect_bbox_tasks(self, frame_bgr: np.ndarray) -> tuple[int, int, int, int] | None:
         if self._tasks_detector is None:
             return None
@@ -320,12 +443,31 @@ class InferenceWorker(threading.Thread):
         y0 = int(bb.origin_y)
         x1 = int(bb.origin_x + bb.width)
         y1 = int(bb.origin_y + bb.height)
-        pad_x = int((x1 - x0) * 0.15)
-        pad_y = int((y1 - y0) * 0.20)
-        return _clamp_bbox(x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y, w, h)
+        return _expand_bbox_scale(x0, y0, x1, y1, w, h, scale=1.2)
 
-    def _process_frame(self, frame_bgr: np.ndarray) -> dict:
+    def _process_frame(self, frame_bgr: np.ndarray, fs_sample: float) -> dict:
         h, w = frame_bgr.shape[:2]
+        avg_prev = self._avg_calib()
+
+        def _idle(pulse: float) -> dict:
+            return {
+                "face_found": False,
+                "bbox": None,
+                "raw_fake_score": 0.5,
+                "calib_fake_score": _calibrate_fake_score(0.5),
+                "avg_fake_score": avg_prev,
+                "fake_prob": 0.5,
+                "fake_prob_smooth": avg_prev,
+                "waveform": np.zeros(120, dtype=np.float32),
+                "bpm": 0.0,
+                "snr": -np.inf,
+                "snr_12hz_ratio": 0.0,
+                "is_bpm_reliable": False,
+                "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
+                "status": "Scanning...",
+                "scan_pulse": pulse,
+            }
+
         if self._tracker_mode != "tasks_detector":
             cx, cy = w // 2, h // 2
             fw, fh = int(w * 0.34), int(h * 0.52)
@@ -333,20 +475,8 @@ class InferenceWorker(threading.Thread):
             face = frame_bgr[y0:y1, x0:x1]
             if face.size == 0:
                 pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
-                return {
-                    "face_found": False,
-                    "bbox": None,
-                    "fake_prob": 0.5,
-                    "fake_prob_smooth": 0.5,
-                    "waveform": np.zeros(120, dtype=np.float32),
-                    "bpm": 0.0,
-                    "snr": -np.inf,
-                    "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
-                    "status": "Scanning...",
-                    "scan_pulse": pulse,
-                }
+                return _idle(pulse)
 
-            # Use three center sub-ROIs to emulate forehead/cheek channels.
             fh2, fw2 = face.shape[:2]
             r_top = face[int(fh2 * 0.10) : int(fh2 * 0.34), int(fw2 * 0.25) : int(fw2 * 0.75)]
             r_l = face[int(fh2 * 0.40) : int(fh2 * 0.78), int(fw2 * 0.08) : int(fw2 * 0.42)]
@@ -364,18 +494,7 @@ class InferenceWorker(threading.Thread):
             bbox = self._detect_bbox_tasks(frame_bgr)
             if bbox is None:
                 pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
-                return {
-                    "face_found": False,
-                    "bbox": None,
-                    "fake_prob": 0.5,
-                    "fake_prob_smooth": 0.5,
-                    "waveform": np.zeros(120, dtype=np.float32),
-                    "bpm": 0.0,
-                    "snr": -np.inf,
-                    "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
-                    "status": "Scanning...",
-                    "scan_pulse": pulse,
-                }
+                return _idle(pulse)
             x0, y0, x1, y1 = bbox
             face = frame_bgr[y0:y1, x0:x1]
             fh2, fw2 = face.shape[:2]
@@ -391,55 +510,55 @@ class InferenceWorker(threading.Thread):
                     bgr = np.mean(r.reshape(-1, 3), axis=0)
                     means.append(np.array([bgr[2], bgr[1], bgr[0]], dtype=np.float32))
                 rgb_mean = np.mean(np.stack(means, axis=0), axis=0)
-            face = frame_bgr[y0:y1, x0:x1]
 
         if face.size == 0:
             pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
-            return {
-                "face_found": False,
-                "bbox": None,
-                "fake_prob": 0.5,
-                "fake_prob_smooth": 0.5,
-                "waveform": np.zeros(120, dtype=np.float32),
-                "bpm": 0.0,
-                "snr": -np.inf,
-                "fft_thumb": np.zeros((64, 64, 3), dtype=np.uint8),
-                "status": "Scanning...",
-                "scan_pulse": pulse,
-            }
+            return _idle(pulse)
+
         self._rgb_trace.append(rgb_mean)
 
-        face = _mcdm_preprocess_placeholder(face)
-        rgb_t = _to_model_tensor_rgb(face).to(self._device)
-        fft_t, fft_thumb_full = _to_model_tensor_fft(face)
+        lap_var = _laplacian_var_bgr(face)
+        low_quality = lap_var < LAPLACIAN_VAR_THRESHOLD
+        face_u = _unsharp_mask_bgr(_mcdm_preprocess_placeholder(face))
+        rgb_t = _to_model_tensor_rgb(face_u).to(self._device)
+        fft_t, fft_thumb_full = _to_model_tensor_fft(face_u)
         fft_t = fft_t.to(self._device)
         with torch.no_grad():
-            fake_prob = float(self._model(rgb_t, fft_t).item())
-        self._fake_hist.append(fake_prob)
-        fake_smooth = float(np.mean(self._fake_hist))
+            fake_prob = float(
+                self._model(rgb_t, fft_t, force_equal_dfa=low_quality).item()
+            )
+
+        calib = _calibrate_fake_score(fake_prob)
+        self._calib_hist.append(calib)
+        avg_fake = float(np.mean(self._calib_hist))
 
         rgb_trace = np.asarray(self._rgb_trace, dtype=np.float32)
-        pos = _pos_signal(rgb_trace, fps=30.0)
-        pos_f = _filter_pos(pos, fps=30.0)
-        bpm, snr = _estimate_bpm_snr(pos_f, fps=30.0)
+        pos = _pos_signal(rgb_trace, fps=fs_sample)
+        pos_f = _filter_pos(pos, fps=fs_sample)
+        bpm, snr_db, snr_12, is_bpm_ok = _estimate_bpm_and_snr_metrics(pos_f, fs_sample)
         waveform = pos_f[-120:] if len(pos_f) > 0 else np.zeros(120, dtype=np.float32)
         if len(waveform) < 120:
             waveform = np.pad(waveform, (120 - len(waveform), 0))
 
         status = "Safe"
-        if fake_smooth >= 0.65:
+        if avg_fake >= 0.65:
             status = "Purifying"
-        elif fake_smooth >= 0.45:
+        elif avg_fake >= 0.45:
             status = "Caution"
 
         return {
             "face_found": True,
             "bbox": (x0, y0, x1, y1),
+            "raw_fake_score": fake_prob,
+            "calib_fake_score": calib,
+            "avg_fake_score": avg_fake,
             "fake_prob": fake_prob,
-            "fake_prob_smooth": fake_smooth,
+            "fake_prob_smooth": avg_fake,
             "waveform": waveform.astype(np.float32),
             "bpm": bpm,
-            "snr": snr,
+            "snr": snr_db,
+            "snr_12hz_ratio": snr_12,
+            "is_bpm_reliable": is_bpm_ok,
             "fft_thumb": cv2.resize(fft_thumb_full, (64, 64), interpolation=cv2.INTER_AREA),
             "status": status,
             "scan_pulse": 1.0,
@@ -489,11 +608,13 @@ def draw_console(
     stability: float,
     bpm: float,
     fake_score: float,
+    raw_fake_score: float,
     status: str,
     waveform: np.ndarray,
     fft_thumb: np.ndarray,
     face_found: bool,
     scan_pulse: float,
+    is_bpm_reliable: bool,
 ) -> np.ndarray:
     panel = np.zeros((PANEL_HEIGHT, PANEL_WIDTH, 3), dtype=np.uint8)
     _draw_glass_panel(panel, 6, 6, PANEL_WIDTH - 7, PANEL_HEIGHT - 7, alpha=0.72)
@@ -502,7 +623,16 @@ def draw_console(
     cv2.putText(panel, "Research Defense Dashboard", (22, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.5, SOFT_WHITE, 1)
 
     _draw_ring_progress(panel, (92, 150), 46, fake_score)
-    cv2.putText(panel, "Fake Score", (45, 218), cv2.FONT_HERSHEY_SIMPLEX, 0.52, SOFT_WHITE, 1)
+    cv2.putText(panel, "Fake Score (avg)", (28, 218), cv2.FONT_HERSHEY_SIMPLEX, 0.48, SOFT_WHITE, 1)
+    cv2.putText(
+        panel,
+        f"raw {raw_fake_score:.2f}",
+        (28, 236),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        PASTEL_BLUE,
+        1,
+    )
 
     thumb_rect = (PANEL_WIDTH - 96, 120, PANEL_WIDTH - 32, 184)
     _draw_glass_panel(panel, thumb_rect[0] - 4, thumb_rect[1] - 4, thumb_rect[2] + 4, thumb_rect[3] + 4, alpha=0.60)
@@ -528,7 +658,10 @@ def draw_console(
     cv2.putText(panel, f"{stability:4.2f}", (gx0 + 16, midy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
 
     cv2.putText(panel, "Heart Rate", (midx + 12, midy + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.54, SOFT_WHITE, 1)
-    cv2.putText(panel, f"{bpm:5.1f} BPM", (midx + 12, midy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
+    if is_bpm_reliable and face_found:
+        cv2.putText(panel, f"{bpm:5.1f} BPM", (midx + 12, midy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
+    else:
+        cv2.putText(panel, "偵測中", (midx + 12, midy + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62, BEIGE, 1)
 
     pulse = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(time.time() * 2.5))
     if status == "Purifying":
@@ -553,7 +686,20 @@ def _make_session_logger(log_dir: Path) -> tuple[csv.DictWriter, object]:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = log_dir / f"session_{ts}.csv"
     f = path.open("w", newline="", encoding="utf-8")
-    writer = csv.DictWriter(f, fieldnames=["time_sec", "fps", "latency_ms", "bpm", "snr_db", "fake_score"])
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "time_sec",
+            "fps",
+            "latency_ms",
+            "bpm",
+            "bpm_reliable",
+            "snr_db",
+            "snr_12hz_ratio",
+            "raw_fake_score",
+            "avg_fake_score",
+        ],
+    )
     writer.writeheader()
     print(f"[INFO] Session log: {path}")
     return writer, f
@@ -562,7 +708,7 @@ def _make_session_logger(log_dir: Path) -> tuple[csv.DictWriter, object]:
 def main() -> None:
     args = _parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    worker = InferenceWorker(device=device)
+    worker = InferenceWorker(device=device, weights_path=args.weights)
     worker.start()
     logger, log_fp = _make_session_logger(args.log_dir)
 
@@ -599,7 +745,7 @@ def main() -> None:
 
             if result["face_found"] and result["bbox"] is not None:
                 x0, y0, x1, y1 = result["bbox"]
-                color = SOFT_PINK if result["fake_prob_smooth"] >= 0.5 else SOFT_WHITE
+                color = SOFT_PINK if float(result.get("avg_fake_score", result["fake_prob_smooth"])) >= 0.5 else SOFT_WHITE
                 cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
             else:
                 pulse = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(time.time() * 2.4))
@@ -612,12 +758,14 @@ def main() -> None:
                 latency_ms=float(result["latency_ms"]),
                 stability=fps_stability,
                 bpm=float(result["bpm"]),
-                fake_score=float(result["fake_prob_smooth"]),
+                fake_score=float(result.get("avg_fake_score", result["fake_prob_smooth"])),
+                raw_fake_score=float(result.get("raw_fake_score", result["fake_prob"])),
                 status=str(result["status"]),
                 waveform=result["waveform"],
                 fft_thumb=result["fft_thumb"],
                 face_found=bool(result["face_found"]),
                 scan_pulse=float(result.get("scan_pulse", 1.0)),
+                is_bpm_reliable=bool(result.get("is_bpm_reliable", False)),
             )
             cv2.imshow(LIVE_WINDOW_NAME, live_thumb)
             cv2.imshow(CONSOLE_WINDOW_NAME, console)
@@ -630,8 +778,11 @@ def main() -> None:
                         "fps": f"{fps:.3f}",
                         "latency_ms": f"{float(result['latency_ms']):.3f}",
                         "bpm": f"{float(result['bpm']):.3f}",
+                        "bpm_reliable": str(bool(result.get("is_bpm_reliable", False))),
                         "snr_db": f"{float(result['snr']):.3f}",
-                        "fake_score": f"{float(result['fake_prob_smooth']):.6f}",
+                        "snr_12hz_ratio": f"{float(result.get('snr_12hz_ratio', 0.0)):.4f}",
+                        "raw_fake_score": f"{float(result.get('raw_fake_score', result['fake_prob'])):.6f}",
+                        "avg_fake_score": f"{float(result.get('avg_fake_score', result['fake_prob_smooth'])):.6f}",
                     }
                 )
                 log_fp.flush()

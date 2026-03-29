@@ -131,6 +131,7 @@ class SpecXNet(nn.Module):
         fft: torch.Tensor,
         return_logits: bool = False,
         return_fusion_weights: bool = False,
+        force_equal_dfa: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for dual-stream inference.
@@ -139,18 +140,30 @@ class SpecXNet(nn.Module):
             rgb: Spatial-domain image tensor.
             fft: Frequency-domain spectrum tensor.
             return_logits: If True, return raw logits.
+            force_equal_dfa: If True, use 50/50 spatial/frequency fusion (ignores learned gates).
         """
         spatial_feat = self.spatial_backbone(rgb)  # [B, D]
         freq_feat = self.freq_backbone(fft)  # [B, D]
-        dfa_out = self.dfa(
-            spatial_feat,
-            freq_feat,
-            return_weights=return_fusion_weights,
-        )
-        if return_fusion_weights:
-            fused_feat, gates = dfa_out
+        if force_equal_dfa:
+            fused_feat = 0.5 * spatial_feat + 0.5 * freq_feat
+            if return_fusion_weights:
+                half = torch.full(
+                    (rgb.shape[0], 2),
+                    0.5,
+                    device=rgb.device,
+                    dtype=spatial_feat.dtype,
+                )
+                gates = half
         else:
-            fused_feat = dfa_out
+            dfa_out = self.dfa(
+                spatial_feat,
+                freq_feat,
+                return_weights=return_fusion_weights,
+            )
+            if return_fusion_weights:
+                fused_feat, gates = dfa_out
+            else:
+                fused_feat = dfa_out
         logits = self.classifier(fused_feat)  # [B, 1]
         output = logits if return_logits else torch.sigmoid(logits)
         if return_fusion_weights:
