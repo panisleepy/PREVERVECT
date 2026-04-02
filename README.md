@@ -1,6 +1,6 @@
 # PREVERVECT
 
-**PREVERVECT** 是一套以 **SpecXNet** 為核心的 Deepfake 偵測研究系統：結合 **空間域（RGB）** 與 **頻域（FFT 功率譜）** 雙流特徵、**DFA（雙流融合）**，並可搭配 **rPPG（遠端心率）** 與即時 **螢幕擷取偵測器**。本文件說明整體架構、計算與分析方法、以及各模組如何執行，方便在另一台電腦上閱讀與重現。
+**PREVERVECT** 是一套以 **SpecXNet** 為核心的 Deepfake 偵測研究系統：結合 **空間域（RGB）** 與 **頻域（FFT 功率譜）** 雙流特徵、**DFA（雙流融合）**，並可搭配 **rPPG（遠端心率）** 與即時 **螢幕擷取偵測器**。本文件說明整體架構、計算與分析方法、以及各模組如何執行。
 
 ---
 
@@ -105,7 +105,7 @@
 
 ### 5.1 執行方式
 
-在專案根目錄、啟用 venv 後（完整指令見 [§8](#8-從另一台電腦取得專案與執行含-venv)）：
+在專案根目錄、啟用 venv 後（完整指令見 [§8](#8-取得專案與執行含-venv)）：
 
 ```bash
 python capture/screen_detector.py
@@ -196,7 +196,7 @@ cd PREVERVECT
 
 在 GitHub 網頁 **Code → Download ZIP**，解壓後進入資料夾（內容應含 `core/`、`capture/`、`requirements.txt`）。
 
-> **注意**：`.gitignore` 通常會排除 `weights/*.pth`、`raw_data/`。新電腦上不會自動有 **訓練好的權重**；請自行從雲端硬碟／隨身碟複製 `specxnet_best.pth` 到專案下的 `weights/`（見 §8.3）。
+> **注意**：`.gitignore` 通常會排除 `weights/*.pth`、`raw_data/`。新環境上不會自動有 **訓練好的權重**；請自行從雲端硬碟／隨身碟複製 `specxnet_best.pth` 到專案下的 `weights/`（見 §8.3）。
 
 ---
 
@@ -323,7 +323,7 @@ python run_rppg_pipeline.py
 
 此路徑與 **桌面版** `capture/screen_detector.py` **互相獨立**：兩者共用 **`core/model.py`** 與 **`weights/`** 內的 SpecXNet 權重，但 **請勿** 把 `app.py` 與螢幕偵測器當成同一支程式。
 
-### 9.1 前置條件（新電腦）
+### 9.1 前置條件
 
 1. 完成 [§8.1](#81-取得程式碼)（clone 或 ZIP）與 [§8.2](#82-建立虛擬環境並安裝依賴)（venv + `pip install -r requirements.txt`）。
 2. 將 **`weights/specxnet_best.pth`**（或你訓練好的 `.pth`）放到專案根目錄下的 **`weights/`**（見 [§8.3](#83-要不要訓練過的模型)）。
