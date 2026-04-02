@@ -9,6 +9,7 @@ from collections import deque
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+import shutil
 
 import cv2
 import mediapipe as mp
@@ -25,10 +26,20 @@ from utils.fft_tools import power_spectrum_shifted_bgr
 # ---------------------------------------------------------------------------
 # 常數：與 core/dataloader、capture/screen_detector 對齊
 # ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+WEIGHTS_DIR = PROJECT_ROOT / "weights"
+TMP_MODEL_DIR = Path(r"C:\temp\prevervect_models")
 MODEL_SIZE = 224
 BPM_SNR_12HZ_THRESHOLD = 1.5
 # 拉普拉斯變異數過低時視為低畫質，強制 DFA 雙流各 50% 融合
 LAPLACIAN_VAR_THRESHOLD = 120.0
+
+# FakeScore：校準 + Moving Average + rPPG reliability 保守回拉（與 capture/screen_detector.py 對齊）
+SCORE_CALIB_OFFSET = 0.3
+SCORE_CALIB_DIV = 0.7
+SCORE_SMOOTH_LEN = 15
+SCORE_RPPG_W_MIN = 0.35
+RPPG_SNR_W_MAX = 3.0
 
 app = FastAPI(title="PREVERVECT API", version="0.1.0")
 app.add_middleware(
@@ -124,9 +135,9 @@ def _laplacian_var_bgr(bgr: np.ndarray) -> float:
 
 def _ensure_blaze_face_model() -> Path | None:
     """下載並快取 MediaPipe BlazeFace 短距離模型（與 screen_detector 一致）。"""
-    model_path = Path("weights/blaze_face_short_range.tflite")
+    model_path = WEIGHTS_DIR / "blaze_face_short_range.tflite"
     if model_path.is_file():
-        return model_path
+        return _copy_to_ascii_tmp(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     url = (
         "https://storage.googleapis.com/mediapipe-models/face_detector/"
@@ -135,10 +146,22 @@ def _ensure_blaze_face_model() -> Path | None:
     try:
         print(f"[INFO] 下載 MediaPipe 人臉偵測模型: {url}")
         urllib.request.urlretrieve(url, str(model_path))
-        return model_path
+        return _copy_to_ascii_tmp(model_path)
     except Exception as e:
         print(f"[WARN] BlazeFace 下載失敗: {e}")
         return None
+
+
+def _copy_to_ascii_tmp(src: Path, dst_name: str | None = None) -> Path:
+    """
+    MediaPipe tasks 在 Windows 上對 Unicode 路徑支援不穩，會出現 errno=-1。
+    將模型複製到 ASCII-only 的 temp 路徑後再載入最穩。
+    """
+    TMP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    dst = TMP_MODEL_DIR / (dst_name or src.name)
+    # Copy overwrites if exists.
+    shutil.copyfile(str(src), str(dst))
+    return dst
 
 
 class DetectorService:
@@ -160,6 +183,14 @@ class DetectorService:
         self.dt_trace: deque[float] = deque(maxlen=90)
         self._last_t: float | None = None
 
+        # FakeScore：calibration 後的 deque(15) 移動平均（與桌面版一致）
+        self._calib_score_hist: deque[float] = deque(maxlen=SCORE_SMOOTH_LEN)
+
+    @staticmethod
+    def _calibrate_fake_score(raw: float) -> float:
+        x = (float(raw) - SCORE_CALIB_OFFSET) / SCORE_CALIB_DIV
+        return float(np.clip(x, 0.0, 1.0))
+
     def _init_face_detectors(self) -> None:
         """初始化 MediaPipe Face Detection；不可用則回退 OpenCV Haar。"""
         try:
@@ -170,7 +201,8 @@ class DetectorService:
                     vision = mp.tasks.vision
                     options = vision.FaceDetectorOptions(
                         base_options=BaseOptions(model_asset_path=str(model_path.resolve())),
-                        min_detection_confidence=0.5,
+                        # 降低門檻以提升在網頁 1FPS / 壓縮畫面下的可偵測性
+                        min_detection_confidence=0.3,
                         running_mode=vision.RunningMode.IMAGE,
                     )
                     self._mp_face_detector = vision.FaceDetector.create_from_options(options)
@@ -180,7 +212,19 @@ class DetectorService:
             print(f"[WARN] MediaPipe Face Detector 初始化失敗: {e}")
 
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        self._haar = cv2.CascadeClassifier(cascade_path)
+        # 同樣處理 unicode 路徑風險：複製到 ASCII-only temp 再載入
+        try:
+            cascade_src = Path(cascade_path)
+            if cascade_src.is_file():
+                cascade_tmp = _copy_to_ascii_tmp(
+                    cascade_src,
+                    dst_name="haarcascade_frontalface_default.xml",
+                )
+                self._haar = cv2.CascadeClassifier(str(cascade_tmp))
+            else:
+                self._haar = cv2.CascadeClassifier(cascade_path)
+        except Exception:
+            self._haar = cv2.CascadeClassifier(cascade_path)
         if self._haar.empty():
             self._haar = None
             print("[ERROR] Haar 分類器無法載入。")
@@ -190,9 +234,9 @@ class DetectorService:
     def _load_weights(self) -> None:
         """依序載入微調權重；無則僅 ImageNet 預訓練骨干。"""
         candidates = [
-            Path("weights/specxnet_best.pth"),
-            Path("weights/specxnet_latest.pth"),
-            Path("weights/specxnet_finetuned.pt"),
+            WEIGHTS_DIR / "specxnet_best.pth",
+            WEIGHTS_DIR / "specxnet_latest.pth",
+            WEIGHTS_DIR / "specxnet_finetuned.pt",
         ]
         for p in candidates:
             if p.is_file():
@@ -241,7 +285,13 @@ class DetectorService:
 
         if self._haar is not None:
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            faces = self._haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
+            # 網頁影片縮圖/縮放後人臉可能偏小，降低 minSize 提升召回
+            faces = self._haar.detectMultiScale(
+                gray,
+                scaleFactor=1.08,
+                minNeighbors=3,
+                minSize=(32, 32),
+            )
             if len(faces) == 0:
                 return None
             x, y, fw, fh = max(faces, key=lambda b: b[2] * b[3])
@@ -290,21 +340,21 @@ class DetectorService:
         return filtfilt(b, a, sig).astype(np.float32)
 
     @staticmethod
-    def _estimate_bpm_reliable(sig: np.ndarray, fs: float) -> bool:
-        """1.1–1.3 Hz 能量與其餘 0.5–4 Hz 能量比，閾值判斷是否可靠。"""
+    def _estimate_bpm_reliable(sig: np.ndarray, fs: float) -> tuple[bool, float]:
+        """回傳 (is_reliable, snr_12hz_ratio)。"""
         if len(sig) < 16 or fs <= 0:
-            return False
+            return False, 0.0
         nperseg = min(256, len(sig))
         freqs, psd = welch(sig, fs=fs, nperseg=nperseg)
         band = (freqs >= 0.5) & (freqs <= 4.0)
         if not np.any(band):
-            return False
+            return False, 0.0
         p_full = float(np.sum(psd[band])) + 1e-12
         band_12 = (freqs >= 1.1) & (freqs <= 1.3)
         p_12 = float(np.sum(psd[band_12]))
         rest = max(p_full - p_12, 1e-12)
         snr_12hz_ratio = p_12 / rest
-        return snr_12hz_ratio >= BPM_SNR_12HZ_THRESHOLD
+        return bool(snr_12hz_ratio >= BPM_SNR_12HZ_THRESHOLD), float(snr_12hz_ratio)
 
     def detect(self, image_base64: str) -> dict[str, Any]:
         """
@@ -319,6 +369,10 @@ class DetectorService:
         if bbox is None:
             return {
                 "fake_score": 0,
+                "raw_fake_score": 0.0,
+                "calib_fake_score": 0.0,
+                "avg_fake_score": 0.0,
+                "snr_12hz_ratio": 0.0,
                 "is_reliable": False,
                 "message": "No face detected",
             }
@@ -329,6 +383,10 @@ class DetectorService:
         if face_roi is None or face_roi.size == 0:
             return {
                 "fake_score": 0,
+                "raw_fake_score": 0.0,
+                "calib_fake_score": 0.0,
+                "avg_fake_score": 0.0,
+                "snr_12hz_ratio": 0.0,
                 "is_reliable": False,
                 "message": "No face detected",
             }
@@ -351,15 +409,34 @@ class DetectorService:
         with torch.no_grad():
             fake_score = float(self.model(rgb_t, fft_t, force_equal_dfa=low_quality).item())
 
+        # FakeScore：校準 + deque(15) 移動平均（img trust）
+        calib_fake_score = self._calibrate_fake_score(fake_score)
+        self._calib_score_hist.append(calib_fake_score)
+        avg_fake_score_img = float(np.mean(self._calib_score_hist))
+
         trace = np.stack(self.rgb_trace, axis=0) if self.rgb_trace else np.zeros((1, 3), dtype=np.float32)
         sig = trace[:, 1] - trace[:, 0]
         sig = sig - np.mean(sig)
         if np.std(sig) > 1e-6:
             sig = sig / (np.std(sig) + 1e-6)
         sig_f = self._filter_pos(sig, fps=fs)
-        is_reliable = self._estimate_bpm_reliable(sig_f, fs=fs)
+        is_reliable, snr_12hz_ratio = self._estimate_bpm_reliable(sig_f, fs=fs)
 
-        return {"fake_score": fake_score, "is_reliable": bool(is_reliable)}
+        # rPPG reliability → conservative回拉
+        denom = max(RPPG_SNR_W_MAX - BPM_SNR_12HZ_THRESHOLD, 1e-6)
+        w_raw = float(np.clip((snr_12hz_ratio - BPM_SNR_12HZ_THRESHOLD) / denom, 0.0, 1.0))
+        w = float(SCORE_RPPG_W_MIN + (1.0 - SCORE_RPPG_W_MIN) * w_raw)
+        avg_fake_score = 0.5 + w * (avg_fake_score_img - 0.5)
+
+        # 兼容舊前端：保留 fake_score 欄位（回傳 avg 版本，讓視覺更一致）
+        return {
+            "fake_score": avg_fake_score,
+            "raw_fake_score": fake_score,
+            "calib_fake_score": calib_fake_score,
+            "avg_fake_score": avg_fake_score,
+            "snr_12hz_ratio": snr_12hz_ratio,
+            "is_reliable": bool(is_reliable),
+        }
 
 
 service = DetectorService()
@@ -381,6 +458,10 @@ def detect(req: DetectRequest) -> dict[str, Any]:
         logging.exception("POST /detect 處理失敗")
         return {
             "fake_score": 0.0,
+            "raw_fake_score": 0.0,
+            "calib_fake_score": 0.0,
+            "avg_fake_score": 0.0,
+            "snr_12hz_ratio": 0.0,
             "is_reliable": False,
             "message": "Inference error",
         }

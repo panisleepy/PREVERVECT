@@ -39,6 +39,12 @@ SCORE_CALIB_OFFSET = 0.3
 SCORE_CALIB_DIV = 0.7
 SCORE_SMOOTH_LEN = 15
 
+# rPPG reliability 回饋到 FakeScore 的「保守」權重下限。
+# is_bpm_reliable 為 False 時，仍保留 w_min 的影像信任度，避免永遠死在 0.5。
+SCORE_RPPG_W_MIN = 0.35
+# 當 snr_12hz_ratio 達到此值時，rPPG 權重趨近 1（用於把 w 從保守逐步放開）。
+RPPG_SNR_W_MAX = 3.0
+
 # Laplacian variance (focus); below → low quality → force 50/50 DFA fusion.
 LAPLACIAN_VAR_THRESHOLD = 120.0
 
@@ -530,12 +536,19 @@ class InferenceWorker(threading.Thread):
 
         calib = _calibrate_fake_score(fake_prob)
         self._calib_hist.append(calib)
-        avg_fake = float(np.mean(self._calib_hist))
+        avg_fake_img = float(np.mean(self._calib_hist))
 
         rgb_trace = np.asarray(self._rgb_trace, dtype=np.float32)
         pos = _pos_signal(rgb_trace, fps=fs_sample)
         pos_f = _filter_pos(pos, fps=fs_sample)
         bpm, snr_db, snr_12, is_bpm_ok = _estimate_bpm_and_snr_metrics(pos_f, fs_sample)
+
+        # rPPG reliability → conservative回饋：
+        # is_bpm_ok 為 False 時，FakeScore 仍可回拉到 0.5 附近，避免誇大跳動。
+        denom = max(RPPG_SNR_W_MAX - BPM_SNR_12HZ_THRESHOLD, 1e-6)
+        w_raw = float(np.clip((snr_12 - BPM_SNR_12HZ_THRESHOLD) / denom, 0.0, 1.0))
+        w = float(SCORE_RPPG_W_MIN + (1.0 - SCORE_RPPG_W_MIN) * w_raw)
+        avg_fake = 0.5 + w * (avg_fake_img - 0.5)
         waveform = pos_f[-120:] if len(pos_f) > 0 else np.zeros(120, dtype=np.float32)
         if len(waveform) < 120:
             waveform = np.pad(waveform, (120 - len(waveform), 0))

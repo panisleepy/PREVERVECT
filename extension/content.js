@@ -8,7 +8,7 @@
   const API_URL = "http://127.0.0.1:8000/detect";
   const CAPTURE_MS = 1000; // 1 FPS
 
-  // 進度條（Fake 分數）：<40% 綠、40%~70% 黃、>70% 紅；僅無臉時為灰
+  // 進度條（Fake 分數）：<45% 綠、45%~65% 黃、>65% 紅；僅無臉時為灰
   const COLOR_GREEN = "#22c55e";
   const COLOR_YELLOW = "#eab308";
   const COLOR_RED = "#ef4444";
@@ -117,8 +117,8 @@
     const pct = Math.max(0, Math.min(100, Number(fakeScore) * 100));
     if (barEl) {
       barEl.style.width = `${pct.toFixed(1)}%`;
-      if (pct < 40) barEl.style.background = COLOR_GREEN;
-      else if (pct <= 70) barEl.style.background = COLOR_YELLOW;
+      if (pct < 45) barEl.style.background = COLOR_GREEN;
+      else if (pct <= 65) barEl.style.background = COLOR_YELLOW;
       else barEl.style.background = COLOR_RED;
     }
   }
@@ -199,7 +199,8 @@
       }
 
       // 有臉且已推論：一律顯示 Fake 分數與彩色進度條（1 FPS 下 rPPG 多半不可靠，不應隱藏主分數）
-      const fs = Math.max(0, Math.min(1, Number(data.fake_score) || 0));
+      // 使用與桌面版一致的 avg_fake_score（已校準/deque(15)/rPPG保守回拉）
+      const fs = Math.max(0, Math.min(1, Number(data.avg_fake_score ?? data.fake_score) || 0));
       const pctStr = `${(fs * 100).toFixed(1)}%`;
       if (textEl) {
         textEl.textContent = pctStr;
