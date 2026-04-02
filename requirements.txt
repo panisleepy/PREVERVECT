@@ -9,4 +9,6 @@ scipy<1.14
 opencv-contrib-python<4.12
 matplotlib
 pygetwindow
+fastapi
+uvicorn
 tqdm

@@ -6,14 +6,26 @@
 
 ## 目錄
 
-1. [系統架構總覽](#1-系統架構總覽)
+1. [系統架構總覽 / 快速上手路徑](#1-系統架構總覽)
 2. [核心模型：SpecXNet](#2-核心模型specxnet)
 3. [訓練流程與資料管線](#3-訓練流程與資料管線)
 4. [評估指標與分析](#4-評估指標與分析)
 5. [即時偵測器 `capture/screen_detector.py`](#5-即時偵測器-capturescreen_detectorpy)
 6. [rPPG 研究管線](#6-rppg-研究管線)
-7. [專案目錄結構](#7-專案目錄結構)
+7. [專案目錄結構](#7-專案目錄結構精簡)
 8. [從另一台電腦取得專案與執行（含 venv）](#8-從另一台電腦取得專案與執行含-venv)
+9. [Chrome 外掛 + FastAPI 後端（瀏覽器管線）](#9-chrome-外掛--fastapi-後端瀏覽器管線)
+
+---
+
+### 另一台電腦要跑什麼？（對照表）
+
+| 你想做的事 | 請看章節 |
+|------------|----------|
+| **桌面螢幕即時偵測**（OpenCV 視窗、`mss` 擷取） | [§5](#5-即時偵測器-capturescreen_detectorpy) 與 [§8.4](#84-即時偵測器在專案根目錄已-activate-venv) |
+| **YouTube / 瀏覽器內影片 + 外掛浮動面板** | [§9](#9-chrome-外掛--fastapi-後端瀏覽器管線)（須先開 **FastAPI**，再載入 **Chrome 擴充功能**） |
+| **環境與依賴** | [§8.2](#82-建立虛擬環境並安裝依賴) |
+| **訓練與權重** | [§3](#3-訓練流程與資料管線)、[§8.3](#83-要不要訓練過的模型)、[§8.5](#85-訓練-specxnet需要-real--fake-影片目錄) |
 
 ---
 
@@ -138,19 +150,25 @@ python capture/screen_detector.py --target_window "YouTube"
 ## 7. 專案目錄結構（精簡）
 
 ```
-PREVERVECT/
+PREVERVECT/                    # 專案根目錄（以下指令皆假設已 cd 到此）
+├── app.py                     # FastAPI：/detect、/health（Chrome 外掛呼叫）
+├── setup_env.py               # 可選：下載 EfficientNet 參考權重、簡單環境自檢
 ├── core/
-│   ├── model.py          # SpecXNet + DFA
-│   ├── dataloader.py     # 影片抽幀、增強
-│   └── train.py          # 訓練與驗證指標
+│   ├── model.py               # SpecXNet + DFA
+│   ├── dataloader.py          # 影片抽幀、增強
+│   └── train.py               # 訓練與驗證指標
 ├── capture/
-│   └── screen_detector.py
+│   └── screen_detector.py    # 桌面即時偵測器（螢幕擷取 + OpenCV）
+├── extension/                 # Chrome 擴充功能（Manifest V3）
+│   ├── manifest.json
+│   ├── content.js             # 1 FPS 送圖至 FastAPI、更新浮動 UI
+│   └── popup.html
 ├── utils/
-│   ├── fft_tools.py      # 功率譜
-│   └── prepare_data.py   # 資料清理等
-├── weights/              # 權重與訓練圖表（通常不提交 Git）
-├── raw_data/             # 本機資料集（通常不提交 Git）
-├── logs/                 # 偵測 session CSV
+│   ├── fft_tools.py           # 功率譜
+│   └── prepare_data.py        # 抽幀／整理資料等
+├── weights/                   # 訓練權重、BlazeFace .tflite（通常不完全提交 Git）
+├── logs/                      # screen_detector session CSV（可選）
+├── raw_data/                  # 本機資料集（若使用；通常不提交 Git）
 ├── advanced_extractor.py
 ├── signal_analytics.py
 ├── stat_reporter.py
@@ -204,7 +222,15 @@ pip install -U pip
 pip install -r requirements.txt
 ```
 
-之後每次開新終端機要先 **啟用同一個 venv**，再執行下面各節的 `python ...` 指令。
+之後每次開新終端機要先 **啟用同一個 venv**，再執行下面各節的 `python ...` 與 `uvicorn ...` 指令。
+
+**（可選）首次下載參考權重與自檢**：
+
+```powershell
+python setup_env.py
+```
+
+會嘗試將 `efficientnet_b0` 預訓練狀態存到 `weights/`，並簡單測試 `mediapipe` / `mss`。與 **SpecXNet 微調權重**（`specxnet_best.pth`）無關，後者請自行複製或訓練產生。
 
 ---
 
@@ -293,6 +319,95 @@ python run_rppg_pipeline.py
 
 ---
 
+## 9. Chrome 外掛 + FastAPI 後端（瀏覽器管線）
+
+此路徑與 **桌面版** `capture/screen_detector.py` **互相獨立**：兩者共用 **`core/model.py`** 與 **`weights/`** 內的 SpecXNet 權重，但 **請勿** 把 `app.py` 與螢幕偵測器當成同一支程式。
+
+### 9.1 前置條件（新電腦）
+
+1. 完成 [§8.1](#81-取得程式碼)（clone 或 ZIP）與 [§8.2](#82-建立虛擬環境並安裝依賴)（venv + `pip install -r requirements.txt`）。
+2. 將 **`weights/specxnet_best.pth`**（或你訓練好的 `.pth`）放到專案根目錄下的 **`weights/`**（見 [§8.3](#83-要不要訓練過的模型)）。
+3. 之後所有指令都在 **專案根目錄** 執行，且終端機已 **`activate` 同一個 venv**。
+
+### 9.2 啟動後端（FastAPI）
+
+在專案根目錄開啟終端機（venv 已啟用），執行：
+
+**Windows（PowerShell）**
+
+```powershell
+cd D:\df
+.\venv\Scripts\Activate.ps1
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+**Linux / macOS**
+
+```bash
+cd /path/to/PREVERVECT
+source venv/bin/activate
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+- 看到類似 `Uvicorn running on http://0.0.0.0:8000` 即表示成功。
+- **`0.0.0.0`** 代表本機網卡皆可連線；瀏覽器與外掛請使用 **`http://127.0.0.1:8000`**（與 `extension/content.js` 內設定一致）。
+
+**快速自檢**
+
+```powershell
+curl http://127.0.0.1:8000/health
+```
+
+預期回傳 JSON：`{"status":"ok"}`。
+
+**第一次執行 `/detect` 時**：後端可能自動下載 MediaPipe **BlazeFace** 模型至 `weights/blaze_face_short_range.tflite`，需網路；請勿關閉防火牆阻擋 Python。
+
+### 9.3 安裝 Chrome 擴充功能（前端）
+
+1. 確認 **`extension/`** 資料夾內有 `manifest.json`、`content.js`、`popup.html`。
+2. 開啟 Chrome，網址列輸入 **`chrome://extensions/`**。
+3. 開啟右上 **「開發人員模式」**。
+4. 點 **「載入未封裝項目」**，選取專案內的 **`extension`** 資料夾（不是整個 repo 根目錄，而是內含 `manifest.json` 的那層）。
+5. 若更新過 `content.js` / `manifest.json`，請在外掛卡片上點 **重新載入**。
+
+### 9.4 端到端操作流程（YouTube 範例）
+
+1. 先保持 **§9.2** 的 **`uvicorn` 終端視窗開著**（後端常駐）。
+2. 開啟 **YouTube**（或其它有 `<video>` 的頁面）並 **播放影片**。
+3. 頁面右上角應出現 **PREVERVECT** 浮動面板；約 **1 FPS** 會向本機 `POST /detect`。
+4. **無臉**時面板會提示「未偵測到人臉」；有臉時會顯示 **Fake 分數** 與綠／黃／紅進度條（語意見 `content.js` 註解）。
+5. **「中斷偵測 (Stop)」** 可停止送圖；若要再測，**重新整理頁面** 或再開一次該分頁（外掛會重新掛載）。
+
+### 9.5 API 約定（給自訂前端或除錯）
+
+| 項目 | 內容 |
+|------|------|
+| 健康檢查 | `GET http://127.0.0.1:8000/health` |
+| 偵測 | `POST http://127.0.0.1:8000/detect`，Body：`{"image_base64":"<Data URL 或純 Base64>"}` |
+| 成功（有臉推論） | `{"fake_score": 0~1, "is_reliable": true/false}` |
+| 無臉 | `{"fake_score": 0, "is_reliable": false, "message": "No face detected"}` |
+
+後端會 **裁臉**（MediaPipe 優先、Haar 備援）、**擴框 20%**、正方形 ROI，再送 **SpecXNet**；與桌面版前處理細節不完全相同，分數可能略有差異。
+
+### 9.6 常見問題
+
+| 現象 | 建議 |
+|------|------|
+| 狀態顯示 **伺服器連線失敗** | 確認 `uvicorn` 是否在跑、埠號是否 **8000**、防火牆是否擋；關閉後再開請 **重新載入擴充功能** 並重整頁面。 |
+| 狀態顯示 **後端錯誤 HTTP 500** | 看執行 `uvicorn` 的終端機 **錯誤堆疊**；多數與依賴、GPU、或暫存圖異常有關。 |
+| Fake 分數不穩或「不準」 | 確認已使用 **自訓** `specxnet_best.pth`；YouTube 壓縮與訓練集分佈不同會造成 **domain gap**。 |
+
+### 9.7 與桌面偵測器的對照
+
+| 項目 | `capture/screen_detector.py` | `app.py` + Chrome |
+|------|------------------------------|-------------------|
+| 擷取來源 | 螢幕（`mss`） | 網頁 `<video>` canvas |
+| UI | OpenCV 雙視窗 | 網頁上浮動面板 |
+| 權重 | 同 `weights/specxnet*.pth` | 同上 |
+| 同時執行 | 可以，但會各載入一份模型、較吃記憶體 | — |
+
+---
+
 ## 版本說明
 
-本 README 描述的是目前儲存庫中的 **設計與實作要點**；實際數值（閾值、epoch、資料路徑）可能因實驗而調整，請以程式碼與 `argparse` 說明為準。從另一台電腦 **clone / 下載 ZIP** 後，務必 **建立 venv、安裝 `requirements.txt`**，並依需求 **自行放入 `weights/specxnet_best.pth`** 或執行訓練。
+本 README 描述的是目前儲存庫中的 **設計與實作要點**；實際數值（閾值、epoch、資料路徑）可能因實驗而調整，請以程式碼與 `argparse` 說明為準。從另一台電腦 **clone / 下載 ZIP** 後，務必 **建立 venv、安裝 `requirements.txt`**，並依需求 **自行放入 `weights/specxnet_best.pth`** 或執行訓練。若使用 **Chrome 管線**，另需依 **§9** 啟動 **FastAPI** 並 **載入擴充功能**。
