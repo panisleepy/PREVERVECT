@@ -246,6 +246,8 @@ python setup_env.py
 
 ### 8.4 即時偵測器（在專案根目錄、已 `activate` venv）
 
+**桌面版**指 `capture/screen_detector.py`：用 `mss` 擷取螢幕，OpenCV 顯示 **Live Feed** 與 **Console** 兩個視窗。
+
 **不帶自訓權重（僅測管線）**：
 
 ```powershell
@@ -265,6 +267,8 @@ python capture\screen_detector.py --weights weights\specxnet_best.pth --target_w
 ```
 
 結束：在 OpenCV 視窗按 **`q`**。
+
+> 註：此路線與 [§9](#9-chrome-外掛--fastapi-後端瀏覽器管線) 的 Chrome 外掛 **互不影響**；Chrome 版需要另開 FastAPI。
 
 ---
 
@@ -336,17 +340,21 @@ python run_rppg_pipeline.py
 **Windows（PowerShell）**
 
 ```powershell
-cd D:\df
+cd "C:\Users\<你的使用者>\OneDrive\文件\PREVERVECT"
 .\venv\Scripts\Activate.ps1
-uvicorn app:app --host 0.0.0.0 --port 8000
+pip install -r requirements.txt
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
+
+若終端機顯示 **`uvicorn` 無法辨識**，請一律改用 **`python -m uvicorn ...`**（不依賴 PATH）。
 
 **Linux / macOS**
 
 ```bash
 cd /path/to/PREVERVECT
 source venv/bin/activate
-uvicorn app:app --host 0.0.0.0 --port 8000
+pip install -r requirements.txt
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 - 看到類似 `Uvicorn running on http://0.0.0.0:8000` 即表示成功。
@@ -362,6 +370,8 @@ curl http://127.0.0.1:8000/health
 
 **第一次執行 `/detect` 時**：後端可能自動下載 MediaPipe **BlazeFace** 模型至 `weights/blaze_face_short_range.tflite`，需網路；請勿關閉防火牆阻擋 Python。
 
+**Windows + 中文路徑提醒**：若 MediaPipe 報 `Unable to open file ... errno=-1`，後端會將模型複製到 **`C:\temp\prevervect_models\`**（ASCII 路徑）再載入；請確保該資料夾可寫入。
+
 ### 9.3 安裝 Chrome 擴充功能（前端）
 
 1. 確認 **`extension/`** 資料夾內有 `manifest.json`、`content.js`、`popup.html`。
@@ -372,13 +382,24 @@ curl http://127.0.0.1:8000/health
 
 ### 9.4 端到端操作流程（YouTube 範例）
 
-1. 先保持 **§9.2** 的 **`uvicorn` 終端視窗開著**（後端常駐）。
+1. 先保持 **§9.2** 的 **`python -m uvicorn ...` 終端視窗開著**（後端常駐）。
 2. 開啟 **YouTube**（或其它有 `<video>` 的頁面）並 **播放影片**。
 3. 頁面右上角應出現 **PREVERVECT** 浮動面板；約 **1 FPS** 會向本機 `POST /detect`。
 4. **無臉**時面板會提示「未偵測到人臉」；有臉時會顯示 **Fake 分數** 與綠／黃／紅進度條（語意見 `content.js` 註解）。
 5. **「中斷偵測 (Stop)」** 可停止送圖；若要再測，**重新整理頁面** 或再開一次該分頁（外掛會重新掛載）。
 
-### 9.5 API 約定（給自訂前端或除錯）
+### 9.5 快速對照：桌面 detector vs Chrome 外掛
+
+| 項目 | 桌面（`capture/screen_detector.py`） | Chrome（`extension/` + `app.py`） |
+|------|-------------------------------------|----------------------------------|
+| 開啟 | §8.4：`python capture\screen_detector.py ...` | §9.2：`python -m uvicorn app:app ...`，再 §9.3 載入外掛 |
+| 擷取來源 | 螢幕 `mss` | 網頁 `<video>` 1 FPS canvas |
+| UI | OpenCV **Live Feed** / **Console** | 網頁右上角浮動面板 |
+| 權重 | `weights/specxnet_best.pth`（或 `--weights`） | 同上（後端讀取 `weights/`） |
+| 關閉 | OpenCV 視窗按 **q** | Stop 按鈕或關分頁；後端用 Ctrl+C |
+| 同時執行 | 可與 Chrome 管線並存，但會 **各載入一份模型**，較吃記憶體 | — |
+
+### 9.6 API 約定（給自訂前端或除錯）
 
 | 項目 | 內容 |
 |------|------|
@@ -389,22 +410,14 @@ curl http://127.0.0.1:8000/health
 
 後端會 **裁臉**（MediaPipe 優先、Haar 備援）、**擴框 20%**、正方形 ROI，再送 **SpecXNet**；與桌面版前處理細節不完全相同，分數可能略有差異。
 
-### 9.6 常見問題
+### 9.7 常見問題
 
 | 現象 | 建議 |
 |------|------|
 | 狀態顯示 **伺服器連線失敗** | 確認 `uvicorn` 是否在跑、埠號是否 **8000**、防火牆是否擋；關閉後再開請 **重新載入擴充功能** 並重整頁面。 |
 | 狀態顯示 **後端錯誤 HTTP 500** | 看執行 `uvicorn` 的終端機 **錯誤堆疊**；多數與依賴、GPU、或暫存圖異常有關。 |
 | Fake 分數不穩或「不準」 | 確認已使用 **自訓** `specxnet_best.pth`；YouTube 壓縮與訓練集分佈不同會造成 **domain gap**。 |
-
-### 9.7 與桌面偵測器的對照
-
-| 項目 | `capture/screen_detector.py` | `app.py` + Chrome |
-|------|------------------------------|-------------------|
-| 擷取來源 | 螢幕（`mss`） | 網頁 `<video>` canvas |
-| UI | OpenCV 雙視窗 | 網頁上浮動面板 |
-| 權重 | 同 `weights/specxnet*.pth` | 同上 |
-| 同時執行 | 可以，但會各載入一份模型、較吃記憶體 | — |
+| PowerShell 說 **`uvicorn` 無法辨識** | 確認已 `Activate` venv；或使用 **`python -m uvicorn app:app ...`**（見 §9.2）。 |
 
 ---
 
